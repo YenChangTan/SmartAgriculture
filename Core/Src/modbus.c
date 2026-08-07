@@ -159,16 +159,18 @@ void ModbusMaster_MonitorTransceive(ModbusMaster *mb){
 		break;
 	case MB_STATE_RX_COMPLETE:
 		//mb->errorCount = 0;
-		mb->modbusReadQueue.requestQueue[mb->modbusReadQueue.head].errorCount =0;
+		//mb->modbusReadQueue.requestQueue[mb->modbusReadQueue.head].errorCount =0;
 		break;
 	case MB_STATE_TIMEOUT:
 		mb->modbusReadQueue.requestQueue[mb->modbusReadQueue.head].errorCount +=1;
 		mb->modbusState = MB_STATE_ERROR;
 		break;
 	case MB_STATE_ERROR:
+
 		break;
 	}
 }
+
 
 void ModbusMaster_UpdateReadTransaction(ModbusMaster *mb){
 	memcpy(&mb->modbusTransaction, &mb->modbusReadQueue.requestQueue[mb->modbusReadQueue.head], sizeof(ModbusMaster_Transaction));
@@ -249,14 +251,17 @@ static void _abort_reception(ModbusMaster *mb){
 }
 
 static void _validate_and_process_received_frame(ModbusMaster *mb){
-	if ((mb ->rxBufferCount == mb -> rxExpectedBufferCount) && (CRC16(mb->rxBuffer,mb->rxBufferCount,0) == 0) && (mb->rxBuffer[0] == mb->modbusTransaction.slaveAddress) && (mb-> rxBuffer[1] == mb->modbusTransaction.functionCode)&& !(mb->rxBuffer[1]&0x80)){
+	if ((mb ->rxBufferCount == mb -> rxExpectedBufferCount) && (CRC16(mb->rxBuffer,mb->rxBufferCount,0) == 0) && (mb->rxBuffer[0] == mb->modbusTransaction.slaveAddress) && (mb-> rxBuffer[1] == mb->modbusTransaction.functionCode)){
 		for(int i = 0; i<mb->modbusTransaction.dataLength;i++){
 			mb->modbusTransaction.data[i] = mb->rxBuffer[3+i*2]<<8|mb->rxBuffer[3+i*2+1];
 		}
+		mb->modbusReadQueue.requestQueue[mb->modbusReadQueue.head].errorCount = 0;
 		mb->modbusState = MB_STATE_RX_COMPLETE;
 	}
 	else{
+		mb->modbusReadQueue.requestQueue[mb->modbusReadQueue.head].errorCount +=1;
 		mb->modbusState = MB_STATE_ERROR;
+
 	}
 }
 

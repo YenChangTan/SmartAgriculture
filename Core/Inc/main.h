@@ -68,17 +68,22 @@ void Error_Handler(void);
 #define OUT_PER_FERT 4
 #define IN_PER_FERT 4
 #define EC_SAMPLE_COUNT 30
-#define MAX_TASK_COUNT 32
+#define MAX_TASK_COUNT 10
+#define MAX_TASK_HISTORY_COUNT 5
+#define MAX_STATE_HISTORY_COUNT 5
 #define MAX_FERT_TYPE 5
 #define MAX_PESTICIDE_TANK 5
-#define INPUT_CHANGE_THRESHOLD 30
+#define INPUT_CHANGE_THRESHOLD 100
 #define DELAY_FOR_VALVE 18000
 #define DEFAULT_EC_HYSTERISIS 100
 #define SLAVE_TX_TIMEOUT 100
 #define SLAVE_RX_TIMEOUT 100
 #define SLAVE_INTERCHAR_TIMEOUT 10
-#define TCP_Buffer_MAX_Count 1024
-#define ERROR_ARRAY_COUNT 100
+#define TCP_Buffer_MAX_Count 3072
+#define ERROR_ARRAY_COUNT 10
+#define NO_FLOW_DELAY 10000
+#define TASK_ID_BYTE_COUNT 40
+#define MAX_SLAVE_NO_CALL_FROM_MASTER_TIME 10000
 
 //typedef enum{
 //	TIMEOUT_MIXED_WATER_WATERING = 0,
@@ -160,8 +165,34 @@ typedef enum{
 	ERROR_FLOWBREADING,
 	ERROR_ALOW,
 	ERROR_BLOW,
+	ERROR_NOFLOW,
+	ERROR_CONTROLBOARDFAIL,
 	ERROR_TYPECOUNT
 }ERROR_TYPE;
+
+typedef enum{
+	EXIT_RESET,
+	EXIT_ELAPSED_TIME_GREATER_THAN_DURATION,
+	EXIT_WATER_RESERVOIR_LOW,
+	EXIT_WATER_RESERVOIR_HIGH,
+	EXIT_MIX_TANK1_LOW,
+	EXIT_MIX_TANK1_HIGH,
+	EXIT_MIX_TANK1_LIMIT,
+	EXIT_MIX_TANK2_LIMIT,
+	EXIT_FERT_TANKS_HIGH,
+	EXIT_EC_REACH_TARGET,
+	EXIT_TYPECOUNT
+}EXIT_TYPE;
+
+typedef enum{
+	WARN_WATER_RESERVOIR_NEED_REFILL,
+	WARN_TANK_A_NEED_REFILL,
+	WARN_TANK_B_NEED_REFILL,
+	WARN_EC_SENSOR_FAULT,
+	WARN_FLOW_METER_A_FAULT,
+	WARN_FLOW_METER_B_FAULT,
+	WARN_COUNT
+}WARNING_TYPE;
 
 typedef struct{
 	uint8_t ValveInMapToRealOutputPin;
@@ -247,10 +278,11 @@ typedef struct{
 
 typedef struct{
 	uint8_t plotID;
+	uint8_t taskID[TASK_ID_BYTE_COUNT];
 	uint32_t duration;
 	uint32_t elapsedTime;
 	uint32_t elapsedTimeStamp;
-	uint32_t timeStamp;
+	uint32_t timeStamp; //startTimeStamp
 	float TargetEC;
 	float Hysterisis;
 	uint8_t ECRatio[MAX_FERT_TYPE];
@@ -265,6 +297,7 @@ typedef struct{
 
 typedef struct{
 	uint8_t plotID;
+	uint8_t taskID[TASK_ID_BYTE_COUNT];
 	uint32_t start;
 	uint32_t end;
 	uint32_t incompleteDuration;
@@ -282,6 +315,21 @@ typedef struct{
 	TaskInfoFIFO InfoFIFO;
 	TaskHistoryFIFO HistoryFIFO;
 }TaskProxy;
+
+typedef struct{
+	uint8_t taskID[TASK_ID_BYTE_COUNT];
+	uint8_t isManual;
+	uint32_t elapsedTime;
+	uint32_t exitTimeStamp;
+	uint16_t exitCode;
+}StateHistory;
+
+typedef struct{
+	StateHistory FIFO[MAX_STATE_HISTORY_COUNT];
+	uint8_t count;
+	uint8_t head;
+	uint8_t tail;
+}StateHistoryFIFO;
 
 typedef enum{
 	SLAVE_COM_IDLE=0,
@@ -337,6 +385,7 @@ typedef enum{
 typedef enum {
     CMD_HEARTBEAT,
     CMD_RESET,
+	CMD_CLEAR_TASK,
     CMD_CLEAR_TASKS,
     CMD_ESTOP,
     CMD_WRITE_TASK,
@@ -349,6 +398,8 @@ typedef enum {
 
 typedef struct{
 	uint8_t isManual;
+	uint8_t isManualNew;
+	uint8_t taskID[TASK_ID_BYTE_COUNT];
 	machineState triggerEvent;
 	uint8_t plotID;
 	uint32_t TimeOut;
@@ -391,9 +442,12 @@ typedef struct{
 	uint32_t AddFertTimeStamp;
 	uint32_t ElapsedTime;
 	uint32_t currentTick;
+	uint32_t scanTime;
 	TaskProxy TaskProxyBuffer;
+	StateHistoryFIFO stateHistoryFIFO;
 	GeneralSetting generalSetting;
-	uint16_t ErrorArray[ERROR_ARRAY_COUNT];
+	uint16_t ErrorCode;
+	uint8_t WarningArray[WARN_COUNT];
 	float TargetEC;
 	uint8_t ErrorCount;
 }machineSetting;

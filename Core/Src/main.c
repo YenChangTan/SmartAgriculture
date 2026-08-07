@@ -21,6 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
 #include <string.h>
 #include "jsmn.h"
 #include "modbus.h"
@@ -80,7 +81,7 @@ static void ResetAllIO(void);
 static int parse_master_request(const char *json, masterRequest *req);
 static void parse_task_object(const char *json, jsmntok_t *task_tok, masterRequest *req);
 static int jsoneq(const char *json, jsmntok_t *tok, const char *s);
-static int parse_int(const char *json, jsmntok_t *tok);
+static uint32_t parse_int(const char *json, jsmntok_t *tok);
 static float parse_float(const char *json, jsmntok_t *tok);
 static float powhere10(int exp);
 static void executeCommand(void);
@@ -94,7 +95,15 @@ static int float_to_string(float value, char *str);
 static void AddErrorCode(uint16_t errorcode);
 static void ClearErrorCode(void);
 static void ModbusTransmitSwitchDevice(void);
-static void TestingIO(void);
+static void TaskHistoryFIFO_Push(TaskHistoryFIFO *fifo, const TaskHistory *taskHistory);
+static void StateHistoryFIFO_Push(StateHistoryFIFO *fifo, const StateHistory *stateHistory);
+static void AppendStateHistory(uint16_t exitcode);
+static void CheckWarningCondition(void);
+static void MoveAllTasksToTaskHistory(void);
+static void MoveTaskToTaskHistory(uint8_t* taskid);
+static void TaskInfoFIFO_Remove(TaskInfoFIFO * fifo, uint8_t* taskid);
+
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -107,18 +116,26 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart){
 		HAL_UART_Receive_IT(MachineSetting.SlaveCom.huart, &MachineSetting.SlaveCom.Buffer[MachineSetting.SlaveCom.bufferCount], 1);
 		MachineSetting.SlaveCom.state = SLAVE_COM_PRE_RX;
 	}
+	else if(huart->Instance == USART3){
+		ModbusMaster_UART_TxCpltCallback(&mb2);
+	}
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
 	if (huart == MachineSetting.TCPCom.huart){
-		HAL_UART_Receive_IT(MachineSetting.TCPCom.huart, &MachineSetting.TCPCom.Buffer[++MachineSetting.TCPCom.BufferCount], 1);
-		MachineSetting.TCPCom.TimeStamp = HAL_GetTick();
+		if(MachineSetting.TCPCom.BufferCount < TCP_Buffer_MAX_Count-1){//The last byte must be 0, so we cant fill the last byte
+			HAL_UART_Receive_IT(MachineSetting.TCPCom.huart, &MachineSetting.TCPCom.Buffer[++MachineSetting.TCPCom.BufferCount], 1);
+			MachineSetting.TCPCom.TimeStamp = HAL_GetTick();
+		}
 
 	}
 	else if (huart == MachineSetting.SlaveCom.huart){
 		MachineSetting.SlaveCom.timeStamp = HAL_GetTick();
 		HAL_UART_Receive_IT(MachineSetting.SlaveCom.huart, &MachineSetting.SlaveCom.Buffer[++MachineSetting.SlaveCom.bufferCount], 1);
 		MachineSetting.SlaveCom.state = SLAVE_COM_RX;
+	}
+	else if (huart->Instance == USART3){
+		ModbusMaster_UART_RxCpltCallback(&mb2);
 	}
 }
 /* USER CODE END 0 */
@@ -159,9 +176,9 @@ int main(void)
   /* USER CODE BEGIN 2 */
   MachineSettingInit();
   ModbusMaster_Init(&mb2,&huart3, GPIOC, GPIO_PIN_8);
-  ModbusMaster_AddReadQueue(&mb2, 1, 0, 2, 50, 300, 300);
-  ModbusMaster_AddReadQueue(&mb2, 2, 13, 2, 50, 300, 300);
-  ModbusMaster_AddReadQueue(&mb2, 3, 13, 2, 50, 300, 300);
+  ModbusMaster_AddReadQueue(&mb2, 1, 1, 1, 300, 300, 300);
+  ModbusMaster_AddReadQueue(&mb2, 2, 10, 2, 300, 300, 300);
+  ModbusMaster_AddReadQueue(&mb2, 3, 10, 2, 300, 300, 300);
   ModbusMaster_UpdateReadTransaction(&mb2);
   memset(IOTestArray,0, sizeof(IOTestArray));
   /* USER CODE END 2 */
@@ -171,14 +188,16 @@ int main(void)
 
   while (1)
   {
-	  StateMachineRunning();
+	  //TestingIO();
+	  uint32_t current = HAL_GetTick();
+	  MachineSetting.scanTime = current - MachineSetting.currentTick;
+	  MachineSetting.currentTick = current;
+	  StateMachineRunningTest();
 	  ModbusTransmitSwitchDevice();
 	  CheckTCP();
-	  currentTime = HAL_GetTick();
 	  IOListUpdate();
 	  SlaveCom();
-
-
+	  CheckWarningCondition();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -312,7 +331,7 @@ static void MX_USART3_UART_Init(void)
 
   /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
-  huart3.Init.BaudRate = 115200;
+  huart3.Init.BaudRate = 9600;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
   huart3.Init.StopBits = UART_STOPBITS_1;
   huart3.Init.Parity = UART_PARITY_NONE;
@@ -463,10 +482,10 @@ static void MachineSettingInit(void){
 	MachineSetting.generalSetting.Outputs.BasicOut[WaterReservoirPump] = 22;
 	MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump] = 23;
 	MachineSetting.generalSetting.Outputs.BasicOut[ValveWaterSource] = 8;
-	MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix1] = 10;
-	MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1] = 9;
-	MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix2] = 12;
-	MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix2] = 11;
+	MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix1] = 9;
+	MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1] = 10;
+	MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix2] = 11;
+	MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix2] = 12;
 	MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FILL_VALVE] = 13;
 	MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_VALVE] = 0;
 	MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_PUMP] = 4;
@@ -513,6 +532,7 @@ static void MachineSettingInit(void){
 	MachineSetting.generalSetting.Fert.Fert[1].in[FERTIN_LOW] = 12;
 	MachineSetting.generalSetting.Fert.Fert[1].in[FERTIN_WARNING] = 13;
 	MachineSetting.generalSetting.Fert.Fert[1].in[FERTIN_HIGH] = 14;
+	MachineSetting.generalSetting.Inputs.BasicIn[Flow] = 15;
 
 	MachineSetting.generalSetting.Inputs.RealPinState[0].IsBind = 1;
 	MachineSetting.generalSetting.Inputs.RealPinState[1].IsBind = 1;
@@ -529,6 +549,7 @@ static void MachineSettingInit(void){
 	MachineSetting.generalSetting.Inputs.RealPinState[12].IsBind = 1;
 	MachineSetting.generalSetting.Inputs.RealPinState[13].IsBind = 1;
 	MachineSetting.generalSetting.Inputs.RealPinState[14].IsBind = 1;
+	MachineSetting.generalSetting.Inputs.RealPinState[15].IsBind = 1;
 
 	MachineSetting.TimeOut[STATE_IDLE] = 0;
 	MachineSetting.TimeOut[STATE_WATER_RESERVOIR_REFILL] = 1800000;
@@ -576,7 +597,8 @@ static void MachineSettingInit(void){
 	MachineSetting.TCPCom.BufferCount = 0;
 	HAL_UART_Receive_IT(MachineSetting.TCPCom.huart, MachineSetting.TCPCom.Buffer, 1);
 
-
+	MachineSetting.manualEvent.isManualNew = 1;
+	MachineSetting.manualEvent.isManual = 1;
 	MachineSetting.manualEvent.ManualResetTimeOut = 300000;
 	uint8_t slaveAddress = 0;
 	for(int i = 0; i<4;i++){
@@ -613,14 +635,27 @@ static void MachineSettingInit(void){
 }
 
 static void StateMachineRunning(void){
+
+	static uint32_t NoFlowTimeStamp = 0;
 	switch(MachineSetting.MachineState){
 	case STATE_IDLE:
+	{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+		if(MachineSetting.manualEvent.isManual != MachineSetting.manualEvent.isManualNew){
+			MachineSetting.manualEvent.isManual = MachineSetting.manualEvent.isManualNew;
+		}
+		MachineSetting.TimeStamp = HAL_GetTick();
 		if(MachineSetting.isAbort != 0){
 			MachineSetting.MachineState = STATE_ABORT;
+
 			break;
 		}
 		if(MachineSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
@@ -674,10 +709,25 @@ static void StateMachineRunning(void){
 		}
 		if(MachineSetting.TaskProxyBuffer.InfoFIFO.count != 0){
 			if(MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime >= MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].duration){
+				TaskHistory taskHistory = {0};
+				memcpy(taskHistory.taskID, MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].taskID, TASK_ID_BYTE_COUNT);
+
+				if(MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].duration> MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime){
+					taskHistory.incompleteDuration = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].duration -  MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+				}
+				else{
+					taskHistory.incompleteDuration = 0;
+				}
+				taskHistory.end = HAL_GetTick();
+				taskHistory.start = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].timeStamp;
+				TaskHistoryFIFO_Push(&MachineSetting.TaskProxyBuffer.HistoryFIFO, &taskHistory);
 				TaskInfoFIFO_RemoveFirst(&MachineSetting.TaskProxyBuffer.InfoFIFO);
 				break;
 			}
 			else{
+				if(MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].timeStamp == 0){
+					MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].timeStamp = HAL_GetTick();
+				}
 				if(MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].TargetEC < 500){
 					if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[WaterResevoirLow]) == GPIO_PIN_SET){
 						MachineSetting.MachineState = STATE_WATER_RESERVOIR_REFILL;
@@ -712,7 +762,7 @@ static void StateMachineRunning(void){
 						else{
 							if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1Limit]) == GPIO_PIN_RESET){
 								if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix2Limit]) == GPIO_PIN_RESET){
-									AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_MIXTANKSFULL);
+									AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_MIXTANKSFULL + 10000);
 									MachineSetting.MachineState = STATE_ERROR;
 									MachineSetting.TimeStamp = HAL_GetTick();
 									break;
@@ -725,9 +775,17 @@ static void StateMachineRunning(void){
 							}
 							else{
 								if(MachineSetting.generalSetting.readingEC.MeanEC > MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].TargetEC + MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].Hysterisis){
-									MachineSetting.MachineState = STATE_CLEAN_WATER_FILLING_LOWER_EC;
-									MachineSetting.TimeStamp = HAL_GetTick();
-									break;
+									if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[WaterResevoirLow]) == GPIO_PIN_SET){
+										MachineSetting.MachineState = STATE_WATER_RESERVOIR_REFILL;
+										MachineSetting.TimeStamp = HAL_GetTick();
+										break;
+									}
+									else{
+										MachineSetting.MachineState = STATE_CLEAN_WATER_FILLING_LOWER_EC;
+										MachineSetting.TimeStamp = HAL_GetTick();
+										break;
+									}
+
 								}
 								else if(MachineSetting.generalSetting.readingEC.MeanEC < MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].TargetEC - MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].Hysterisis){
 									MachineSetting.MachineState = STATE_FERTILIZER_ADDING;
@@ -745,37 +803,59 @@ static void StateMachineRunning(void){
 			break;
 		}
 		break;
+	}
 	case STATE_WATER_RESERVOIR_REFILL:
+	{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.isAbort != 0){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(MachineSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		MachineSetting.ElapsedTime = HAL_GetTick()- MachineSetting.TimeStamp;
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[WaterReservoirPump], GPIO_PIN_SET);
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[WaterResevoirHigh]) == GPIO_PIN_RESET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_WATER_RESERVOIR_HIGH);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(HAL_GetTick()-MachineSetting.TimeStamp > MachineSetting.TimeOut[STATE_WATER_RESERVOIR_REFILL]){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		break;
+	}
 	case STATE_CLEAN_WATER_WATERING:
+	{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.isAbort != 0){
 			MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(MachineSetting.isError != 0){
 			MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
@@ -789,7 +869,8 @@ static void StateMachineRunning(void){
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveWaterSource], GPIO_PIN_SET);
 		if(MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].plotID >= MachineSetting.generalSetting.ValveOutCount){
 			MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_PLOTOUTOFRANGE);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_PLOTOUTOFRANGE + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_PLOTOUTOFRANGE + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
@@ -797,37 +878,64 @@ static void StateMachineRunning(void){
 			WriteOutput(MachineSetting.generalSetting.ValveOut[MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].plotID], GPIO_PIN_SET);
 		}
 		if(HAL_GetTick()-MachineSetting.TimeStamp < DELAY_FOR_VALVE){
+			NoFlowTimeStamp = HAL_GetTick();
 			break;
 		}
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_SET);
 
 		if( MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime > MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].duration){
 			MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_ELAPSED_TIME_GREATER_THAN_DURATION);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[WaterResevoirLow]) == GPIO_PIN_SET){
 			MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_WATER_RESERVOIR_LOW);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Flow]) == GPIO_PIN_RESET){
+			if((HAL_GetTick()-NoFlowTimeStamp) > NO_FLOW_DELAY){
+				MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				MachineSetting.MachineState = STATE_ERROR;
+				break;
+			}
+		}
+		else{
+			NoFlowTimeStamp = HAL_GetTick();
+		}
+
 		if(MachineSetting.ElapsedTime > MachineSetting.TimeOut[STATE_CLEAN_WATER_WATERING]){
 			MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		break;
+	}
 	case STATE_MIXED_WATER_WATERING:
+	{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.isAbort != 0){
 			MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(MachineSetting.isError != 0){
 			MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
@@ -841,7 +949,8 @@ static void StateMachineRunning(void){
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1], GPIO_PIN_SET);
 		if(MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].plotID >= MachineSetting.generalSetting.ValveOutCount){
 			MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_PLOTOUTOFRANGE);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_PLOTOUTOFRANGE + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_PLOTOUTOFRANGE + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
@@ -849,50 +958,78 @@ static void StateMachineRunning(void){
 			WriteOutput(MachineSetting.generalSetting.ValveOut[MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].plotID], GPIO_PIN_SET);
 		}
 		if(HAL_GetTick()-MachineSetting.TimeStamp < DELAY_FOR_VALVE){
+			NoFlowTimeStamp = HAL_GetTick();
 			break;
 		}
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_SET);
 
 		if( MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime > MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].duration){
 			MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_ELAPSED_TIME_GREATER_THAN_DURATION);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1Low]) == GPIO_PIN_SET){
 			MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_MIX_TANK1_LOW);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Flow]) == GPIO_PIN_RESET){
+			if((HAL_GetTick()-NoFlowTimeStamp) > NO_FLOW_DELAY){
+				MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				MachineSetting.MachineState = STATE_ERROR;
+				break;
+			}
+		}
+		else{
+			NoFlowTimeStamp = HAL_GetTick();
+		}
+
 		if(MachineSetting.ElapsedTime > MachineSetting.TimeOut[STATE_MIXED_WATER_WATERING]){
 			MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 
 		break;
-
+	}
 	case STATE_CLEAN_WATER_FILLING_LOWER_EC:{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.isAbort != 0){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(MachineSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		MachineSetting.ElapsedTime = HAL_GetTick()- MachineSetting.TimeStamp;
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix1], GPIO_PIN_SET);
-		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1], GPIO_PIN_SET);
+
 		if (MachineSetting.generalSetting.readingEC.modbusSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ECREADING);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ECREADING + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ECREADING + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
-		if(MachineSetting.ElapsedTime < 18000){
+		if(MachineSetting.ElapsedTime < DELAY_FOR_VALVE){
+			WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1], GPIO_PIN_SET);
+			NoFlowTimeStamp = HAL_GetTick();
 			break;
 		}
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_SET);
@@ -906,7 +1043,7 @@ static void StateMachineRunning(void){
 			TimeStamp = HAL_GetTick();
 		}
 		if (ReadOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1]) == GPIO_PIN_RESET){
-			if(ECLowerThanTarget == 1 && HAL_GetTick()-TimeStamp >30000){
+			if(ECLowerThanTarget == 1){
 				WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveWaterSource], GPIO_PIN_RESET);
 				WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1], GPIO_PIN_SET);
 				TimeStamp = HAL_GetTick();
@@ -915,13 +1052,14 @@ static void StateMachineRunning(void){
 		else{
 			if(ECLowerThanTarget != 0){
 				if(HAL_GetTick()-TimeStamp >60000){
+					AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_EC_REACH_TARGET);
 					MachineSetting.MachineState = STATE_ABORT;
 					TimeStamp = HAL_GetTick();
 					break;
 				}
 			}
 			else{
-				if(HAL_GetTick()-TimeStamp >30000){
+				if(HAL_GetTick()-TimeStamp >10000){
 					WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveWaterSource], GPIO_PIN_SET);
 					WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1], GPIO_PIN_RESET);
 					TimeStamp = HAL_GetTick();
@@ -929,32 +1067,58 @@ static void StateMachineRunning(void){
 			}
 		}
 		if(HAL_GetTick()-MachineSetting.TimeStamp > MachineSetting.TimeOut[STATE_CLEAN_WATER_FILLING_LOWER_EC]){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
-		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1Limit] == GPIO_PIN_RESET)){
+
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Flow]) == GPIO_PIN_RESET){
+			if((HAL_GetTick()-NoFlowTimeStamp) > NO_FLOW_DELAY){
+				MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				MachineSetting.MachineState = STATE_ERROR;
+				break;
+			}
+		}
+		else{
+			NoFlowTimeStamp = HAL_GetTick();
+		}
+
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1Limit]) == GPIO_PIN_RESET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_MIX_TANK1_LIMIT);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[WaterResevoirLow]) == GPIO_PIN_SET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_WATER_RESERVOIR_LOW);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		break;
 	}
 	case STATE_WATER_FILLING_TO_MIX1_HIGHSENSOR:
+	{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.isAbort != 0){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(MachineSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
-		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix1], GPIO_PIN_RESET);
+		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix1], GPIO_PIN_SET);
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix2Low]) == GPIO_PIN_SET){
 			WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveWaterSource], GPIO_PIN_RESET);
 			WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix2], GPIO_PIN_SET);
@@ -964,36 +1128,64 @@ static void StateMachineRunning(void){
 			WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix2], GPIO_PIN_RESET);
 		}
 		if(MachineSetting.ElapsedTime < DELAY_FOR_VALVE){
+			NoFlowTimeStamp = HAL_GetTick();
 			break;
 		}
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_SET);
 		if(HAL_GetTick()-MachineSetting.TimeStamp > MachineSetting.TimeOut[STATE_WATER_FILLING_TO_MIX1_HIGHSENSOR]){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
+
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Flow]) == GPIO_PIN_RESET){
+			if((HAL_GetTick()-NoFlowTimeStamp) > NO_FLOW_DELAY){
+				MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				MachineSetting.MachineState = STATE_ERROR;
+				break;
+			}
+		}
+		else{
+			NoFlowTimeStamp = HAL_GetTick();
+		}
+
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1High]) == GPIO_PIN_RESET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_MIX_TANK1_HIGH);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1Limit]) == GPIO_PIN_RESET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_MIX_TANK1_LIMIT);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[WaterResevoirLow]) == GPIO_PIN_SET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_WATER_RESERVOIR_LOW);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		break;
+	}
 	case STATE_FERTILIZER_ADDING:{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.isAbort != 0){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(MachineSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
@@ -1002,34 +1194,38 @@ static void StateMachineRunning(void){
 		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix1], GPIO_PIN_SET);
 		if(MachineSetting.generalSetting.Fert.Fert[0].modbusSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_FLOWAREADING);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_FLOWAREADING + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_FLOWAREADING + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		if(MachineSetting.generalSetting.Fert.Fert[1].modbusSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_FLOWBREADING);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_FLOWBREADING + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_FLOWBREADING + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		if (MachineSetting.generalSetting.readingEC.modbusSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ECREADING);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ECREADING + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ECREADING + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		if(HAL_GetTick()-MachineSetting.TimeStamp < DELAY_FOR_VALVE){
+			NoFlowTimeStamp = HAL_GetTick();
 			WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1], GPIO_PIN_SET);
 			MachineSetting.generalSetting.Fert.Fert[0].StampValue = MachineSetting.generalSetting.Fert.Fert[0].modbusSetting.value;
 			MachineSetting.generalSetting.Fert.Fert[1].StampValue = MachineSetting.generalSetting.Fert.Fert[1].modbusSetting.value;
 			break;
 		}
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_SET);
-		uint8_t currentECHigherThanTarget = (MachineSetting.generalSetting.readingEC.MeanEC < MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].TargetEC - MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].Hysterisis);
+		uint8_t currentECHigherThanTarget = (MachineSetting.generalSetting.readingEC.MeanEC > MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].TargetEC);
 		if(ECHigherThanTarget != currentECHigherThanTarget){
 			ECHigherThanTarget = currentECHigherThanTarget;
 			TimeStamp = HAL_GetTick();
 		}
 		if (ReadOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_PUMP]) == GPIO_PIN_SET || ReadOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_FERT_PUMP]) == GPIO_PIN_SET) {
-			if(ECHigherThanTarget == 1 && HAL_GetTick()-TimeStamp > 8000){
+			if(ECHigherThanTarget == 1){
 				WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_PUMP],GPIO_PIN_RESET);
 				WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_VALVE],GPIO_PIN_RESET);
 				WriteOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_FERT_PUMP],GPIO_PIN_RESET);
@@ -1064,6 +1260,7 @@ static void StateMachineRunning(void){
 		else{
 			if(ECHigherThanTarget != 0){
 				if(HAL_GetTick()-TimeStamp >60000){
+					AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_EC_REACH_TARGET);
 					MachineSetting.MachineState = STATE_ABORT;
 					TimeStamp = HAL_GetTick();
 
@@ -1071,7 +1268,7 @@ static void StateMachineRunning(void){
 				}
 			}
 			else{
-				if(HAL_GetTick()-TimeStamp >10000){
+				if(HAL_GetTick()-TimeStamp >5000){
 					WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_PUMP],GPIO_PIN_SET);
 					WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_VALVE],GPIO_PIN_SET);
 					WriteOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_FERT_PUMP],GPIO_PIN_SET);
@@ -1081,25 +1278,42 @@ static void StateMachineRunning(void){
 			}
 		}
 		if(HAL_GetTick()- MachineSetting.TimeStamp> MachineSetting.TimeOut[STATE_FERTILIZER_ADDING]){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1Limit]) == GPIO_PIN_RESET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_MIX_TANK1_LIMIT);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 
 		if(ReadInput(MachineSetting.generalSetting.Fert.Fert[0].in[FERTIN_LOW]) == GPIO_PIN_SET){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ALOW);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ALOW + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ALOW + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 
 		if(ReadInput(MachineSetting.generalSetting.Fert.Fert[1].in[FERTIN_LOW]) == GPIO_PIN_SET){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_BLOW);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_BLOW + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_BLOW + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
+		}
+
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Flow]) == GPIO_PIN_RESET){
+			if((HAL_GetTick()-NoFlowTimeStamp) > NO_FLOW_DELAY){
+				MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				MachineSetting.MachineState = STATE_ERROR;
+				break;
+			}
+		}
+		else{
+			NoFlowTimeStamp = HAL_GetTick();
 		}
 
 
@@ -1108,12 +1322,21 @@ static void StateMachineRunning(void){
 		break;
 	}
 	case STATE_OVERFLOW_RECOVERY:
+	{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.isAbort != 0){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(MachineSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
@@ -1126,52 +1349,90 @@ static void StateMachineRunning(void){
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_SET);
 
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1High]) == GPIO_PIN_SET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_MIX_TANK1_HIGH);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix2Limit]) == GPIO_PIN_RESET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_MIX_TANK2_LIMIT);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 
 		if(MachineSetting.ElapsedTime >MachineSetting.TimeOut[STATE_OVERFLOW_RECOVERY]){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Flow]) == GPIO_PIN_RESET  && (HAL_GetTick()-MachineSetting.TimeStamp > DELAY_FOR_VALVE+5000)){
+			if((HAL_GetTick()-NoFlowTimeStamp) > NO_FLOW_DELAY){
+				MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				MachineSetting.MachineState = STATE_ERROR;
+				break;
+			}
+		}
+		else{
+			NoFlowTimeStamp = HAL_GetTick();
+		}
+
 
 		break;
+	}
 	case STATE_MANUAL_WATER_RESERVOIR_REFILL:
+	{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.isAbort != 0){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(MachineSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		MachineSetting.ElapsedTime = HAL_GetTick()- MachineSetting.TimeStamp;
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[WaterReservoirPump], GPIO_PIN_SET);
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[WaterResevoirHigh]) == GPIO_PIN_RESET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_WATER_RESERVOIR_HIGH);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(HAL_GetTick()-MachineSetting.TimeStamp > MachineSetting.TimeOut[STATE_MANUAL_WATER_RESERVOIR_REFILL]){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		break;
+	}
 	case STATE_MANUAL_CLEAN_WATER_WATERING:
+	{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.isAbort != 0){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(MachineSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
@@ -1179,6 +1440,7 @@ static void StateMachineRunning(void){
 			MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp - DELAY_FOR_VALVE;
 		}
 		else{
+			NoFlowTimeStamp = HAL_GetTick();
 			MachineSetting.ElapsedTime = 0;
 		}
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveWaterSource], GPIO_PIN_SET);
@@ -1186,7 +1448,8 @@ static void StateMachineRunning(void){
 			WriteOutput(MachineSetting.generalSetting.ValveOut[MachineSetting.manualEvent.plotID], GPIO_PIN_SET);
 		}
 		else{
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_PLOTOUTOFRANGE);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_PLOTOUTOFRANGE + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_PLOTOUTOFRANGE + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 		}
 		if(HAL_GetTick()-MachineSetting.TimeStamp < DELAY_FOR_VALVE){
@@ -1194,24 +1457,54 @@ static void StateMachineRunning(void){
 		}
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_SET);
 
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Flow]) == GPIO_PIN_RESET){
+			if((HAL_GetTick()-NoFlowTimeStamp) > NO_FLOW_DELAY){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				MachineSetting.MachineState = STATE_ERROR;
+				break;
+			}
+		}
+		else{
+			NoFlowTimeStamp = HAL_GetTick();
+		}
+
+		if(HAL_GetTick()-MachineSetting.TimeStamp > MachineSetting.TimeOut[MachineSetting.MachineState]){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[WaterResevoirLow]) == GPIO_PIN_SET){
-			MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_WATER_RESERVOIR_LOW);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 
-		if(MachineSetting.ElapsedTime > MachineSetting.TimeOut[STATE_MANUAL_CLEAN_WATER_WATERING]){
+		if(MachineSetting.ElapsedTime > MachineSetting.manualEvent.TimeOut){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_ELAPSED_TIME_GREATER_THAN_DURATION);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		break;
+	}
 	case STATE_MANUAL_MIXED_WATER_WATERING:
+	{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.isAbort != 0){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(MachineSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
@@ -1226,58 +1519,94 @@ static void StateMachineRunning(void){
 			WriteOutput(MachineSetting.generalSetting.ValveOut[MachineSetting.manualEvent.plotID], GPIO_PIN_SET);
 		}
 		else{
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_PLOTOUTOFRANGE);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_PLOTOUTOFRANGE + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_PLOTOUTOFRANGE + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 		}
 		if(HAL_GetTick()-MachineSetting.TimeStamp < DELAY_FOR_VALVE){
+			NoFlowTimeStamp = HAL_GetTick();
 			break;
 		}
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_SET);
 
 
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1Low]) == GPIO_PIN_SET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_MIX_TANK1_LOW);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 
-		if(MachineSetting.ElapsedTime > MachineSetting.TimeOut[STATE_MANUAL_MIXED_WATER_WATERING]){
+		if(MachineSetting.ElapsedTime > MachineSetting.manualEvent.TimeOut){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_ELAPSED_TIME_GREATER_THAN_DURATION);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
+
+		if(HAL_GetTick()-MachineSetting.TimeStamp > MachineSetting.TimeOut[MachineSetting.MachineState]){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Flow]) == GPIO_PIN_RESET){
+			if((HAL_GetTick()-NoFlowTimeStamp) > NO_FLOW_DELAY){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				MachineSetting.MachineState = STATE_ERROR;
+				break;
+			}
+		}
+		else{
+			NoFlowTimeStamp = HAL_GetTick();
+		}
+
 		break;
+	}
 	case STATE_MANUAL_CLEAN_WATER_FILLING_LOWER_EC:{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.isAbort != 0){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(MachineSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		MachineSetting.ElapsedTime = HAL_GetTick()- MachineSetting.TimeStamp;
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix1], GPIO_PIN_SET);
-		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1], GPIO_PIN_SET);
+
 		if (MachineSetting.generalSetting.readingEC.modbusSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ECREADING);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ECREADING + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ECREADING + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		if(MachineSetting.ElapsedTime < DELAY_FOR_VALVE){
+			NoFlowTimeStamp = HAL_GetTick();
+			WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1], GPIO_PIN_SET);
 			break;
 		}
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_SET);
 
 		static uint32_t TimeStamp = 0;
 		static uint8_t ECLowerThanTarget = 0;
-		uint8_t currentECLowerThanTarget = (MachineSetting.generalSetting.readingEC.MeanEC < MachineSetting.TargetEC);
+		uint8_t currentECLowerThanTarget = (MachineSetting.generalSetting.readingEC.MeanEC < MachineSetting.manualEvent.TargetEC);
 
 		if(ECLowerThanTarget != currentECLowerThanTarget){
 			ECLowerThanTarget = currentECLowerThanTarget;
 			TimeStamp = HAL_GetTick();
 		}
 		if (ReadOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1]) == GPIO_PIN_RESET){
-			if(ECLowerThanTarget == 1 && HAL_GetTick()-TimeStamp >30000){
+			if(ECLowerThanTarget == 1){
 				WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveWaterSource], GPIO_PIN_RESET);
 				WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1], GPIO_PIN_SET);
 				TimeStamp = HAL_GetTick();
@@ -1286,13 +1615,14 @@ static void StateMachineRunning(void){
 		else{
 			if(ECLowerThanTarget != 0){
 				if(HAL_GetTick()-TimeStamp >60000){
+					AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_EC_REACH_TARGET);
 					MachineSetting.MachineState = STATE_ABORT;
 					TimeStamp = HAL_GetTick();
 					break;
 				}
 			}
 			else{
-				if(HAL_GetTick()-TimeStamp >30000){
+				if(HAL_GetTick()-TimeStamp >10000){
 					WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveWaterSource], GPIO_PIN_SET);
 					WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1], GPIO_PIN_RESET);
 					TimeStamp = HAL_GetTick();
@@ -1300,32 +1630,58 @@ static void StateMachineRunning(void){
 			}
 		}
 		if(MachineSetting.ElapsedTime > MachineSetting.TimeOut[STATE_MANUAL_CLEAN_WATER_FILLING_LOWER_EC]){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
-		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1Limit] == GPIO_PIN_RESET)){
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1Limit]) == GPIO_PIN_RESET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_MIX_TANK1_LIMIT);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[WaterResevoirLow]) == GPIO_PIN_SET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_WATER_RESERVOIR_LOW);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
+
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Flow]) == GPIO_PIN_RESET){
+			if((HAL_GetTick()-NoFlowTimeStamp) > NO_FLOW_DELAY){
+				MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				MachineSetting.MachineState = STATE_ERROR;
+				break;
+			}
+		}
+		else{
+			NoFlowTimeStamp = HAL_GetTick();
+		}
+
 		break;
 	}
 	case STATE_MANUAL_WATER_FILLING_TO_MIX1_HIGHSENSOR:
+	{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.isAbort != 0){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(MachineSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
-		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix1], GPIO_PIN_RESET);
+		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix1], GPIO_PIN_SET);
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix2Low]) == GPIO_PIN_SET){
 			WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveWaterSource], GPIO_PIN_RESET);
 			WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix2], GPIO_PIN_SET);
@@ -1335,34 +1691,62 @@ static void StateMachineRunning(void){
 			WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix2], GPIO_PIN_RESET);
 		}
 		if(MachineSetting.ElapsedTime < DELAY_FOR_VALVE){
+			NoFlowTimeStamp = HAL_GetTick();
 			break;
 		}
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_SET);
 		if(MachineSetting.ElapsedTime > MachineSetting.TimeOut[STATE_MANUAL_WATER_FILLING_TO_MIX1_HIGHSENSOR]){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1High]) == GPIO_PIN_RESET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_MIX_TANK1_HIGH);
 			MachineSetting.MachineState = STATE_ABORT;;
 			break;
 		}
 		else if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1Limit]) == GPIO_PIN_RESET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_MIX_TANK1_LIMIT);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[WaterResevoirLow]) == GPIO_PIN_SET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_WATER_RESERVOIR_LOW);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
+
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Flow]) == GPIO_PIN_RESET){
+			if((HAL_GetTick()-NoFlowTimeStamp) > NO_FLOW_DELAY){
+				MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW +10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				MachineSetting.MachineState = STATE_ERROR;
+				break;
+			}
+		}
+		else{
+			NoFlowTimeStamp = HAL_GetTick();
+		}
+
 		break;
+	}
 	case STATE_MANUAL_FERTILIZER_ADDING:{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.isAbort != 0){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(MachineSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
@@ -1371,17 +1755,20 @@ static void StateMachineRunning(void){
 		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix1], GPIO_PIN_SET);
 		if(MachineSetting.generalSetting.Fert.Fert[0].modbusSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_FLOWAREADING);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_FLOWAREADING + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_FLOWAREADING + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		if(MachineSetting.generalSetting.Fert.Fert[1].modbusSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_FLOWBREADING);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_FLOWBREADING +10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_FLOWBREADING + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		if (MachineSetting.generalSetting.readingEC.modbusSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ECREADING);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ECREADING + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ECREADING + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
@@ -1389,16 +1776,17 @@ static void StateMachineRunning(void){
 			WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1], GPIO_PIN_SET);
 			MachineSetting.generalSetting.Fert.Fert[0].StampValue = MachineSetting.generalSetting.Fert.Fert[0].modbusSetting.value;
 			MachineSetting.generalSetting.Fert.Fert[1].StampValue = MachineSetting.generalSetting.Fert.Fert[1].modbusSetting.value;
+			NoFlowTimeStamp = HAL_GetTick();
 			break;
 		}
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_SET);
-		uint8_t currentECHigherThanTarget = (MachineSetting.generalSetting.readingEC.MeanEC>MachineSetting.TargetEC);
+		uint8_t currentECHigherThanTarget = (MachineSetting.generalSetting.readingEC.MeanEC>MachineSetting.manualEvent.TargetEC);
 		if(ECHigherThanTarget != currentECHigherThanTarget){
 			ECHigherThanTarget = currentECHigherThanTarget;
 			TimeStamp = HAL_GetTick();
 		}
 		if (ReadOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_PUMP]) == GPIO_PIN_SET || ReadOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_FERT_PUMP]) == GPIO_PIN_SET) {
-			if(ECHigherThanTarget == 1 && HAL_GetTick()-TimeStamp > 8000){
+			if(ECHigherThanTarget == 1 && HAL_GetTick()){
 				WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_PUMP],GPIO_PIN_RESET);
 				WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_VALVE],GPIO_PIN_RESET);
 				WriteOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_FERT_PUMP],GPIO_PIN_RESET);
@@ -1433,6 +1821,7 @@ static void StateMachineRunning(void){
 		else{
 			if(ECHigherThanTarget != 0){
 				if(HAL_GetTick()-TimeStamp >60000){
+					AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_EC_REACH_TARGET);
 					MachineSetting.MachineState = STATE_ABORT;
 					TimeStamp = HAL_GetTick();
 
@@ -1440,7 +1829,7 @@ static void StateMachineRunning(void){
 				}
 			}
 			else{
-				if(HAL_GetTick()-TimeStamp >10000){
+				if(HAL_GetTick()-TimeStamp >5000){
 					WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_PUMP],GPIO_PIN_SET);
 					WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_VALVE],GPIO_PIN_SET);
 					WriteOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_FERT_PUMP],GPIO_PIN_SET);
@@ -1450,39 +1839,63 @@ static void StateMachineRunning(void){
 			}
 		}
 		if(HAL_GetTick()- MachineSetting.TimeStamp> MachineSetting.TimeOut[STATE_MANUAL_FERTILIZER_ADDING]){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1Limit]) == GPIO_PIN_RESET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_MIX_TANK1_LIMIT);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 
 		if(ReadInput(MachineSetting.generalSetting.Fert.Fert[0].in[FERTIN_LOW]) == GPIO_PIN_SET){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ALOW);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ALOW + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ALOW + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 
 		if(ReadInput(MachineSetting.generalSetting.Fert.Fert[1].in[FERTIN_LOW]) == GPIO_PIN_SET){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_BLOW);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_BLOW +10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_BLOW + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Flow]) == GPIO_PIN_RESET){
+			if((HAL_GetTick()-NoFlowTimeStamp) > NO_FLOW_DELAY){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				MachineSetting.MachineState = STATE_ERROR;
+				break;
+			}
+		}
+		else{
+			NoFlowTimeStamp = HAL_GetTick();
+		}
 
 		MachineSetting.generalSetting.Fert.Fert[0].CurrentVolume = MachineSetting.generalSetting.Fert.Fert[0].modbusSetting.value - MachineSetting.generalSetting.Fert.Fert[0].StampValue;
 		MachineSetting.generalSetting.Fert.Fert[1].CurrentVolume = MachineSetting.generalSetting.Fert.Fert[1].modbusSetting.value - MachineSetting.generalSetting.Fert.Fert[1].StampValue;
 		break;
 	}
 	case STATE_MANUAL_OVERFLOW_RECOVERY:
+	{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.isAbort != 0){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 		if(MachineSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
@@ -1490,27 +1903,63 @@ static void StateMachineRunning(void){
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1], GPIO_PIN_SET);
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix2], GPIO_PIN_SET);
 		if(HAL_GetTick()-MachineSetting.TimeStamp < DELAY_FOR_VALVE){
+			NoFlowTimeStamp = HAL_GetTick();
 			break;
 		}
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_SET);
 
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix1High]) == GPIO_PIN_SET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_MIX_TANK1_HIGH);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Mix2Limit]) == GPIO_PIN_RESET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_MIX_TANK2_LIMIT);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 
 		if(HAL_GetTick()-MachineSetting.TimeStamp >MachineSetting.TimeOut[STATE_MANUAL_OVERFLOW_RECOVERY]){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
+
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Flow]) == GPIO_PIN_RESET){
+			if((HAL_GetTick()-NoFlowTimeStamp) > NO_FLOW_DELAY){
+				MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTimeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				MachineSetting.MachineState = STATE_ERROR;
+				break;
+			}
+		}
+		else{
+			NoFlowTimeStamp = HAL_GetTick();
+		}
 		break;
+	}
 	case STATE_MANUAL_FILL_FERTILIZER_TANK:
+	{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+		if(MachineSetting.isAbort != 0){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(MachineSetting.isError != 0){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveWaterSource], GPIO_PIN_SET);
 
@@ -1529,56 +1978,122 @@ static void StateMachineRunning(void){
 		}
 
 		if(HAL_GetTick()-MachineSetting.TimeStamp< DELAY_FOR_VALVE){
+			NoFlowTimeStamp = HAL_GetTick();
 			break;
 		}
 		WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_SET);
 
 		if(ReadInput(MachineSetting.generalSetting.Fert.Fert[0].in[FERTIN_HIGH]) == GPIO_PIN_RESET && ReadInput(MachineSetting.generalSetting.Fert.Fert[1].in[FERTIN_HIGH]) == GPIO_PIN_RESET){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_FERT_TANKS_HIGH);
 			MachineSetting.MachineState = STATE_ABORT;
 			break;
 		}
 
 		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[WaterResevoirLow]) == GPIO_PIN_SET){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_RESERVOIRLOW);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_RESERVOIRLOW + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_RESERVOIRLOW + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 
 		if(MachineSetting.ElapsedTime > MachineSetting.TimeOut[STATE_MANUAL_FILL_FERTILIZER_TANK]){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT +10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
 
+		if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[Flow]) == GPIO_PIN_RESET){
+			if((HAL_GetTick()-NoFlowTimeStamp) > NO_FLOW_DELAY){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_NOFLOW + 10000);
+				MachineSetting.MachineState = STATE_ERROR;
+				break;
+			}
+		}
+		else{
+			NoFlowTimeStamp = HAL_GetTick();
+		}
 		break;
+	}
 	case STATE_MANUAL_FILL_PESTICIDE_TANK:
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		MachineSetting.MachineState = STATE_ABORT;
 		break;
 	case STATE_MANUAL_DISSOLVE_SOLID_FERTILIZER:
+	{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+		if(MachineSetting.isAbort != 0){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_RESET);
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(MachineSetting.isError != 0){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
 		WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_PROPELLER], GPIO_PIN_SET);
 		WriteOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_PROPELLER], GPIO_PIN_SET);
-		if(MachineSetting.ElapsedTime>MachineSetting.TimeOut[STATE_MANUAL_DISSOLVE_SOLID_FERTILIZER]){
+		if(MachineSetting.ElapsedTime>MachineSetting.manualEvent.TimeOut){
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + EXIT_ELAPSED_TIME_GREATER_THAN_DURATION);
 			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(HAL_GetTick()-MachineSetting.TimeStamp > MachineSetting.TimeOut[MachineSetting.MachineState]){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_TIMEOUT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
 		}
 		break;
+	}
 	case STATE_ABORT:
+	{
+		if(MachineSetting.SlaveCom.ErrorCount > 5){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_CONTROLBOARDFAIL + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+		if(MachineSetting.manualEvent.isManual != MachineSetting.manualEvent.isManualNew){
+			MachineSetting.manualEvent.isManual = MachineSetting.manualEvent.isManualNew;
+		}
 		if(MachineSetting.isAbort != 0){
 			MachineSetting.isAbort = 0;
 		}
 		if(MachineSetting.isError != 0){
-			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP);
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
 			break;
 		}
+
 		ClearErrorCode();
 		ResetAllIO();
+
+
+
 		MachineSetting.MachineState = STATE_IDLE;
 		break;
+	}
 	case STATE_ERROR:
+	{
 		if(MachineSetting.isAbort != 0){
 			MachineSetting.MachineState = STATE_ABORT;
-			break;
+			//break;
 		}
 		if(MachineSetting.isError != 0){
 			MachineSetting.isError = 0;
@@ -1586,12 +2101,26 @@ static void StateMachineRunning(void){
 		ResetAllIO();
 		break;
 	}
+	case STATE_COUNT:
+		MachineSetting.MachineState = STATE_ABORT;
+		break;
+	}
 }
 
 static void StateMachineRunningTest(void){
 	switch(MachineSetting.MachineState){
 	case STATE_IDLE:
+		if(MachineSetting.isAbort != 0){
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(MachineSetting.isError != 0){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(MachineSetting.manualEvent.isManual != 0){
+
 			switch (MachineSetting.manualEvent.triggerEvent){
 			case STATE_MANUAL_MIXED_WATER_WATERING:
 				MachineSetting.MachineState = STATE_MANUAL_MIXED_WATER_WATERING;
@@ -1641,46 +2170,124 @@ static void StateMachineRunningTest(void){
 		}
 		if(MachineSetting.TaskProxyBuffer.InfoFIFO.count != 0){
 			if(MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime >= MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].duration){
+				TaskHistory taskHistory = {0};
+				memcpy(taskHistory.taskID, MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].taskID, TASK_ID_BYTE_COUNT);
+
+				if(MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].duration> MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime){
+					taskHistory.incompleteDuration = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].duration -  MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+				}
+				else{
+					taskHistory.incompleteDuration = 0;
+				}
+				taskHistory.end = HAL_GetTick();
+				taskHistory.start = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].timeStamp;
+				TaskHistoryFIFO_Push(&MachineSetting.TaskProxyBuffer.HistoryFIFO, &taskHistory);
 				TaskInfoFIFO_RemoveFirst(&MachineSetting.TaskProxyBuffer.InfoFIFO);
+				break;
+
 			}
 			else{
+				if(MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].timeStamp == 0){
+					MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].timeStamp = HAL_GetTick();
+				}
 				MachineSetting.MachineState = STATE_MIXED_WATER_WATERING;
 				MachineSetting.TimeStamp = HAL_GetTick();
-				MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].timeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
+				//MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].timeStamp = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime;
 			}
 		}
 		break;
 	case STATE_WATER_RESERVOIR_REFILL:
 		break;
-	case STATE_MIXED_WATER_WATERING:
-		if(MachineSetting.generalSetting.Inputs.RealPinState[0].PinStatus == GPIO_PIN_SET){
-			rand = HAL_GetTick();
+	case STATE_CLEAN_WATER_WATERING:
+		if(MachineSetting.isAbort != 0){
+			uint32_t rand = HAL_GetTick();
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(MachineSetting.isError != 0){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
 			MachineSetting.MachineState = STATE_ERROR;
-//			for(int i = 0; i<MachineSetting.ErrorCount; i++){
-//				if(MachineSetting.ErrorArray[i] == MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT]){
-//					return;
-//				}
-//			}
-//			MachineSetting.ErrorArray[MachineSetting.ErrorCount++] = MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT];
+			break;
+		}
+
+		if(HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_8) == GPIO_PIN_RESET){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
+		if(MachineSetting.generalSetting.Inputs.RealPinState[0].PinStatus == GPIO_PIN_SET){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
 		}
 		if( MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime > MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].duration){
-			rand = HAL_GetTick();
+			uint32_t rand = HAL_GetTick();
 			if(rand%100<30){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
 				MachineSetting.MachineState = STATE_ERROR;
-//				for(int i = 0; i<MachineSetting.ErrorCount; i++){
-//					if(MachineSetting.ErrorArray[i] == MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT]){
-//						return;
-//					}
-//				}
-//				MachineSetting.ErrorArray[MachineSetting.ErrorCount++] = MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT];
+
 			}
 			else{
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
 				MachineSetting.MachineState = STATE_ABORT;
 			}
 			return;
 		}
 		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
 		MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].timeStamp + MachineSetting.ElapsedTime;
+		break;
+	case STATE_MIXED_WATER_WATERING:
+		if(MachineSetting.isAbort != 0){
+			uint32_t rand = HAL_GetTick();
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(MachineSetting.isError != 0){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+		if(HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_8) == GPIO_PIN_RESET){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
+		if(MachineSetting.generalSetting.Inputs.RealPinState[0].PinStatus == GPIO_PIN_SET){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+		}
+		if( MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime > MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].duration){
+			uint32_t rand = HAL_GetTick();
+			if(rand%100<30){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+				MachineSetting.MachineState = STATE_ERROR;
+
+			}
+			else{
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
+				MachineSetting.MachineState = STATE_ABORT;
+			}
+			return;
+		}
+		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
+		MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head].elapsedTime = MachineSetting.ElapsedTime;
 		break;
 
 	case STATE_CLEAN_WATER_FILLING_LOWER_EC:
@@ -1692,191 +2299,420 @@ static void StateMachineRunningTest(void){
 	case STATE_OVERFLOW_RECOVERY:
 		break;
 	case STATE_MANUAL_WATER_RESERVOIR_REFILL:
+		if(MachineSetting.isAbort != 0){
+			uint32_t rand = HAL_GetTick();
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(MachineSetting.isError != 0){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
+		if(HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_8) == GPIO_PIN_RESET){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
 		if(HAL_GetTick()-MachineSetting.TimeStamp>10000){
 			uint32_t rand = HAL_GetTick();
 			if(rand%100<30){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
 				MachineSetting.MachineState = STATE_ERROR;
-//				for(int i = 0; i<MachineSetting.ErrorCount; i++){
-//					if(MachineSetting.ErrorArray[i] == MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT]){
-//						return;
-//					}
-//				}
-//				MachineSetting.ErrorArray[MachineSetting.ErrorCount++] = MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT];
+
 			}
 			else{
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
 				MachineSetting.MachineState = STATE_ABORT;
 			}
 			return;
 		}
+		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
 		break;
 	case STATE_MANUAL_MIXED_WATER_WATERING:
-		if(HAL_GetTick()-MachineSetting.TimeStamp>MachineSetting.TimeOut[STATE_MANUAL_MIXED_WATER_WATERING]){
+		if(MachineSetting.isAbort != 0){
+			uint32_t rand = HAL_GetTick();
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+
+		if(HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_8) == GPIO_PIN_RESET){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
+		if(MachineSetting.isError != 0){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+		if(HAL_GetTick()-MachineSetting.TimeStamp>MachineSetting.manualEvent.TimeOut){
 			uint32_t rand = HAL_GetTick();
 			if(rand%100<30){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
 				MachineSetting.MachineState = STATE_ERROR;
-//				for(int i = 0; i<MachineSetting.ErrorCount; i++){
-//					if(MachineSetting.ErrorArray[i] == MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT]){
-//						return;
-//					}
-//				}
-//				MachineSetting.ErrorArray[MachineSetting.ErrorCount++] = MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT];
+
 			}
 			else{
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
 				MachineSetting.MachineState = STATE_ABORT;
 			}
 			return;
 		}
+		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
 		break;
 	case STATE_MANUAL_CLEAN_WATER_WATERING:
-		if(HAL_GetTick()-MachineSetting.TimeStamp>MachineSetting.TimeOut[STATE_MANUAL_CLEAN_WATER_WATERING]){
+		if(MachineSetting.isAbort != 0){
+			uint32_t rand = HAL_GetTick();
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(MachineSetting.isError != 0){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
+		if(HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_8) == GPIO_PIN_RESET){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
+		if(HAL_GetTick()-MachineSetting.TimeStamp>MachineSetting.manualEvent.TimeOut){
 			uint32_t rand = HAL_GetTick();
 			if(rand%100<30){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
 				MachineSetting.MachineState = STATE_ERROR;
-//				for(int i = 0; i<MachineSetting.ErrorCount; i++){
-//					if(MachineSetting.ErrorArray[i] == MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT]){
-//						return;
-//					}
-//				}
-//				MachineSetting.ErrorArray[MachineSetting.ErrorCount++] = MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT];
+
 			}
 			else{
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
 				MachineSetting.MachineState = STATE_ABORT;
 			}
 			return;
 		}
+		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
 		break;
 	case STATE_MANUAL_CLEAN_WATER_FILLING_LOWER_EC:
+		if(MachineSetting.isAbort != 0){
+			uint32_t rand = HAL_GetTick();
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(MachineSetting.isError != 0){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
+		if(HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_8) == GPIO_PIN_RESET){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
 		if(HAL_GetTick()-MachineSetting.TimeStamp>10000){
 			uint32_t rand = HAL_GetTick();
 			if(rand%100<30){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
 				MachineSetting.MachineState = STATE_ERROR;
-//				for(int i = 0; i<MachineSetting.ErrorCount; i++){
-//					if(MachineSetting.ErrorArray[i] == MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT]){
-//						return;
-//					}
-//				}
-//				MachineSetting.ErrorArray[MachineSetting.ErrorCount++] = MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT];
+
 			}
 			else{
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
 				MachineSetting.MachineState = STATE_ABORT;
 			}
 			return;
 		}
+		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
 		break;
 	case STATE_MANUAL_WATER_FILLING_TO_MIX1_HIGHSENSOR:
+		if(MachineSetting.isAbort != 0){
+			uint32_t rand = HAL_GetTick();
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(MachineSetting.isError != 0){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
+		if(HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_8) == GPIO_PIN_RESET){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(HAL_GetTick()-MachineSetting.TimeStamp>10000){
 			uint32_t rand = HAL_GetTick();
 			if(rand%100<30){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
 				MachineSetting.MachineState = STATE_ERROR;
-//				for(int i = 0; i<MachineSetting.ErrorCount; i++){
-//					if(MachineSetting.ErrorArray[i] == MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT]){
-//						return;
-//					}
-//				}
-//				MachineSetting.ErrorArray[MachineSetting.ErrorCount++] = MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT];
+
 			}
 			else{
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
 				MachineSetting.MachineState = STATE_ABORT;
 			}
 			return;
 		}
+		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
 		break;
 	case STATE_MANUAL_FERTILIZER_ADDING:
+		if(MachineSetting.isAbort != 0){
+			uint32_t rand = HAL_GetTick();
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(MachineSetting.isError != 0){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
+		if(HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_8) == GPIO_PIN_RESET){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
 		if(HAL_GetTick()-MachineSetting.TimeStamp>10000){
 			uint32_t rand = HAL_GetTick();
 			if(rand%100<30){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
 				MachineSetting.MachineState = STATE_ERROR;
-//				for(int i = 0; i<MachineSetting.ErrorCount; i++){
-//					if(MachineSetting.ErrorArray[i] == MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT]){
-//						return;
-//					}
-//				}
-//				MachineSetting.ErrorArray[MachineSetting.ErrorCount++] = MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT];
+
 			}
 			else{
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
 				MachineSetting.MachineState = STATE_ABORT;
 			}
 			return;
 		}
+		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
 		break;
 	case STATE_MANUAL_OVERFLOW_RECOVERY:
+		if(MachineSetting.isAbort != 0){
+			uint32_t rand = HAL_GetTick();
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(MachineSetting.isError != 0){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
+		if(HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_8) == GPIO_PIN_RESET){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
 		if(HAL_GetTick()-MachineSetting.TimeStamp>10000){
 			uint32_t rand = HAL_GetTick();
 			if(rand%100<30){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
 				MachineSetting.MachineState = STATE_ERROR;
-//				for(int i = 0; i<MachineSetting.ErrorCount; i++){
-//					if(MachineSetting.ErrorArray[i] == MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT]){
-//						return;
-//					}
-//				}
-//				MachineSetting.ErrorArray[MachineSetting.ErrorCount++] = MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT];
+
 			}
 			else{
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
 				MachineSetting.MachineState = STATE_ABORT;
 			}
 			return;
 		}
+		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
 		break;
 	case STATE_MANUAL_FILL_FERTILIZER_TANK:
+		if(MachineSetting.isAbort != 0){
+			uint32_t rand = HAL_GetTick();
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(MachineSetting.isError != 0){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
+		if(HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_8) == GPIO_PIN_RESET){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
 		if(HAL_GetTick()-MachineSetting.TimeStamp>10000){
 			uint32_t rand = HAL_GetTick();
 			if(rand%100<30){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
 				MachineSetting.MachineState = STATE_ERROR;
-//				for(int i = 0; i<MachineSetting.ErrorCount; i++){
-//					if(MachineSetting.ErrorArray[i] == MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT]){
-//						return;
-//					}
-//				}
-//				MachineSetting.ErrorArray[MachineSetting.ErrorCount++] = MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT];
+
 			}
 			else{
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
 				MachineSetting.MachineState = STATE_ABORT;
 			}
 			return;
 		}
+		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
 		break;
 	case STATE_MANUAL_FILL_PESTICIDE_TANK:
+		if(MachineSetting.isAbort != 0){
+			uint32_t rand = HAL_GetTick();
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(MachineSetting.isError != 0){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
+		if(HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_8) == GPIO_PIN_RESET){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
 		if(HAL_GetTick()-MachineSetting.TimeStamp>10000){
 			uint32_t rand = HAL_GetTick();
 			if(rand%100<30){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
 				MachineSetting.MachineState = STATE_ERROR;
-//				for(int i = 0; i<MachineSetting.ErrorCount; i++){
-//					if(MachineSetting.ErrorArray[i] == MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT]){
-//						return;
-//					}
-//				}
-//				MachineSetting.ErrorArray[MachineSetting.ErrorCount++] = MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT];
+
 			}
 			else{
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
 				MachineSetting.MachineState = STATE_ABORT;
 			}
 			return;
 		}
 		break;
 	case STATE_MANUAL_DISSOLVE_SOLID_FERTILIZER:
-		if(HAL_GetTick()-MachineSetting.TimeStamp>MachineSetting.TimeOut[STATE_MANUAL_DISSOLVE_SOLID_FERTILIZER]){
+		if(MachineSetting.isAbort != 0){
+			uint32_t rand = HAL_GetTick();
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
+			MachineSetting.MachineState = STATE_ABORT;
+			break;
+		}
+		if(MachineSetting.isError != 0){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+
+		if(HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_8) == GPIO_PIN_RESET){
+			uint32_t rand = HAL_GetTick();
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+		if(HAL_GetTick()-MachineSetting.TimeStamp>MachineSetting.manualEvent.TimeOut){
 			uint32_t rand = HAL_GetTick();
 			if(rand%100<30){
+				AddErrorCode((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%ERROR_TYPECOUNT + 10000);
 				MachineSetting.MachineState = STATE_ERROR;
-//				for(int i = 0; i<MachineSetting.ErrorCount; i++){
-//					if(MachineSetting.ErrorArray[i] == MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT]){
-//						return;
-//					}
-//				}
-//				MachineSetting.ErrorArray[MachineSetting.ErrorCount++] = MachineSetting.Errortypearr[(rand%100)%ERROR_TYPE_COUNT];
+
 			}
 			else{
+				AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + rand%EXIT_TYPECOUNT);
 				MachineSetting.MachineState = STATE_ABORT;
 			}
 			return;
 		}
+		MachineSetting.ElapsedTime = HAL_GetTick()-MachineSetting.TimeStamp;
 		break;
 	case STATE_ABORT:
+		if(MachineSetting.manualEvent.isManual != MachineSetting.manualEvent.isManualNew){
+			MachineSetting.manualEvent.isManual = MachineSetting.manualEvent.isManualNew;
+		}
+		if(MachineSetting.isAbort != 0){
+			MachineSetting.isAbort = 0;
+		}
+		if(MachineSetting.isError != 0){
+			AddErrorCode((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			AppendStateHistory((uint16_t)MachineSetting.MachineState*100 + ERROR_ESTOP + 10000);
+			MachineSetting.MachineState = STATE_ERROR;
+			break;
+		}
+		ClearErrorCode();
 		ResetAllIO();
 		MachineSetting.MachineState = STATE_IDLE;
 		break;
 	case STATE_ERROR:
+		if(MachineSetting.isAbort != 0){
+			MachineSetting.MachineState = STATE_ABORT;
+			//break;
+		}
+		if(MachineSetting.isError != 0){
+			MachineSetting.isError = 0;
+		}
+
 		ResetAllIO();
+		break;
+	case STATE_COUNT:
 		break;
 	}
 }
@@ -1980,6 +2816,11 @@ static void SlaveCom(void){
 				HAL_UART_Receive_IT(MachineSetting.SlaveCom.huart, &MachineSetting.SlaveCom.Buffer[MachineSetting.SlaveCom.bufferCount], 1);
 			}
 		}
+		else if(HAL_GetTick()-MachineSetting.SlaveCom.timeStamp > MAX_SLAVE_NO_CALL_FROM_MASTER_TIME){
+			for(int i = 0; i<LOCAL_OUT; i++){
+				MachineSetting.generalSetting.Outputs.RealPinState[i].PinStatus =GPIO_PIN_SET;
+			}
+		}
 		return;
 	}
 	if(MachineSetting.SlaveCom.slaveCount == 0){
@@ -2037,6 +2878,7 @@ static void SlaveCom(void){
 			HAL_UART_AbortReceive(MachineSetting.SlaveCom.huart);
 			uint8_t bufferCount = 0;
 			if((MachineSetting.SlaveCom.bufferCount == (OUT_PER_SLAVE+BITS_PER_BYTE-1)/BITS_PER_BYTE + (IN_PER_SLAVE+BITS_PER_BYTE-1)/BITS_PER_BYTE + 1) && (MachineSetting.SlaveCom.Buffer[bufferCount++] == MachineSetting.SlaveCom.currentSlave+1) ){
+				MachineSetting.SlaveCom.ErrorCount = 0;
 				bufferCount += (OUT_PER_SLAVE+BITS_PER_BYTE-1)/BITS_PER_BYTE;
 				for(int i = 0; i<(IN_PER_SLAVE-1+BITS_PER_BYTE)/BITS_PER_BYTE; i++){
 					uint8_t currentByte = MachineSetting.SlaveCom.Buffer[bufferCount++];
@@ -2058,6 +2900,7 @@ static void SlaveCom(void){
 						}
 					}
 				}
+
 			}
 			else{
 				MachineSetting.SlaveCom.ErrorCount ++;
@@ -2089,32 +2932,31 @@ static void SlaveCom(void){
 
 static void CheckTCP(void){
 	if(MachineSetting.TCPCom.MasterRequest.isNewCommandComing != 0){
-		HAL_GPIO_WritePin(MachineSetting.TCPCom.DirectionalPin.Port, MachineSetting.TCPCom.DirectionalPin.Pin, GPIO_PIN_SET);
-		//HAL_UART_Transmit(MachineSetting.TCPCom.huart, MachineSetting.TCPCom.Buffer, MachineSetting.TCPCom.BufferCount, MachineSetting.TCPCom.txTimeOut);
-//		MachineSetting.TCPCom.BufferCount = 0;
-//		memset(&MachineSetting.TCPCom.Buffer, 0, sizeof(TCP_Buffer_MAX_Count));
-		int jsonParseSuccess = 0;
-		jsonParseSuccess = build_status_json(MachineSetting.TCPCom.Buffer, TCP_Buffer_MAX_Count);
-		if(jsonParseSuccess == -1){
+		if(MachineSetting.TCPCom.MasterRequest.isNewCommandComing < 2){
+			HAL_GPIO_WritePin(MachineSetting.TCPCom.DirectionalPin.Port, MachineSetting.TCPCom.DirectionalPin.Pin, GPIO_PIN_SET);
+			//HAL_UART_Transmit(MachineSetting.TCPCom.huart, MachineSetting.TCPCom.Buffer, MachineSetting.TCPCom.BufferCount, MachineSetting.TCPCom.txTimeOut);
+		//		MachineSetting.TCPCom.BufferCount = 0;
+		//		memset(&MachineSetting.TCPCom.Buffer, 0, sizeof(TCP_Buffer_MAX_Count));
+			int jsonParseSuccess = 0;
+			jsonParseSuccess = build_status_json((char*)MachineSetting.TCPCom.Buffer, TCP_Buffer_MAX_Count);
+			if(jsonParseSuccess == -1){
 
+			}
+			else{
+				MachineSetting.TCPCom.BufferCount = jsonParseSuccess;
+				HAL_UART_Transmit(MachineSetting.TCPCom.huart,MachineSetting.TCPCom.Buffer, MachineSetting.TCPCom.BufferCount, MachineSetting.TCPCom.txTimeOut);
+			}
+			HAL_GPIO_WritePin(MachineSetting.TCPCom.DirectionalPin.Port, MachineSetting.TCPCom.DirectionalPin.Pin, GPIO_PIN_RESET);
+			MachineSetting.TCPCom.BufferCount = 0;
+			memset(MachineSetting.TCPCom.Buffer, 0, sizeof(MachineSetting.TCPCom.Buffer));
+			MachineSetting.TCPCom.TimeStamp = HAL_GetTick();
+			HAL_UART_Receive_IT(MachineSetting.TCPCom.huart, MachineSetting.TCPCom.Buffer, 1);
+			MachineSetting.TCPCom.MasterRequest.isNewCommandComing = 0;
 		}
-		else{
-			MachineSetting.TCPCom.BufferCount = jsonParseSuccess;
-			HAL_UART_Transmit(MachineSetting.TCPCom.huart,MachineSetting.TCPCom.Buffer, MachineSetting.TCPCom.BufferCount, MachineSetting.TCPCom.txTimeOut);
-		}
-		HAL_GPIO_WritePin(MachineSetting.TCPCom.DirectionalPin.Port, MachineSetting.TCPCom.DirectionalPin.Pin, GPIO_PIN_RESET);
-		MachineSetting.TCPCom.BufferCount = 0;
-		memset(MachineSetting.TCPCom.Buffer, 0, sizeof(MachineSetting.TCPCom.Buffer));
-		MachineSetting.TCPCom.TimeStamp = HAL_GetTick();
-		HAL_UART_Receive_IT(MachineSetting.TCPCom.huart, MachineSetting.TCPCom.Buffer, 1);
-		MachineSetting.TCPCom.MasterRequest.isNewCommandComing = 0;
 	}
 	if ((HAL_GetTick()-MachineSetting.TCPCom.TimeStamp > MachineSetting.TCPCom.intercharTimeOut) && MachineSetting.TCPCom.BufferCount>0){
 		HAL_UART_AbortReceive(MachineSetting.TCPCom.huart);
-		if(MachineSetting.TCPCom.BufferCount >= TCP_Buffer_MAX_Count){
-			MachineSetting.TCPCom.Buffer[TCP_Buffer_MAX_Count-1] = 0;
-		}
-		parse_master_request(MachineSetting.TCPCom.Buffer, &MachineSetting.TCPCom.MasterRequest);
+		parse_master_request((char*)MachineSetting.TCPCom.Buffer, &MachineSetting.TCPCom.MasterRequest);
 		executeCommand();
 		memset(&MachineSetting.TCPCom.Buffer,0, sizeof(MachineSetting.TCPCom.Buffer));
 		MachineSetting.TCPCom.BufferCount = 0;
@@ -2132,7 +2974,7 @@ static void CheckTCP(void){
 
 static int parse_master_request(const char *json, masterRequest *req) {
     jsmn_parser parser;
-    jsmntok_t tokens[80];
+    static jsmntok_t tokens[32];
     jsmn_init(&parser);
     int num = jsmn_parse(&parser, json, strlen(json), tokens, sizeof(tokens)/sizeof(tokens[0]));
     if (num < 0) return -1;
@@ -2165,6 +3007,7 @@ static int parse_master_request(const char *json, masterRequest *req) {
     // Determine command based on event string
     if (strcmp(event_buf, "heartbeat") == 0) req->cmd = CMD_HEARTBEAT;
     else if (strcmp(event_buf, "reset") == 0) req->cmd = CMD_RESET;
+    else if (strcmp(event_buf, "clear_task") == 0) req->cmd = CMD_CLEAR_TASK;
     else if (strcmp(event_buf, "clear_tasks") == 0) req->cmd = CMD_CLEAR_TASKS;
     else if (strcmp(event_buf, "estop") == 0) req->cmd = CMD_ESTOP;
     else if (strcmp(event_buf, "write_task") == 0) req->cmd = CMD_WRITE_TASK;
@@ -2174,7 +3017,7 @@ static int parse_master_request(const char *json, masterRequest *req) {
     else if (strcmp(event_buf, "manual_trigger") == 0) req->cmd = CMD_MANUAL_TRIGGER;
 
     // Parse additional data based on command
-    if (req->cmd == CMD_WRITE_TASK && task_tok != NULL && task_tok->type == JSMN_OBJECT) {
+    if ((req->cmd == CMD_WRITE_TASK || req->cmd == CMD_CLEAR_TASK) && task_tok != NULL && task_tok->type == JSMN_OBJECT) {
         parse_task_object(json, task_tok, req);
     }
     else if (req->cmd == CMD_MANUAL_TRIGGER && manual_tok != NULL && manual_tok->type == JSMN_OBJECT) {
@@ -2193,8 +3036,11 @@ static int parse_master_request(const char *json, masterRequest *req) {
             } else if (jsoneq(json, key, "targetEC") == 0) {
                 req->manual.TargetEC = parse_float(json, val);
             } else if (jsoneq(json, key, "plotID") == 0) {
-				req->manual.plotID = (uint32_t)parse_int(json, val);
+				req->manual.plotID = (uint8_t)parse_int(json, val);
+			} else if(jsoneq(json, key, "taskID")== 0){
+				snprintf((char*)req->manual.taskID, TASK_ID_BYTE_COUNT, "%.*s", val->end - val->start, json + val->start);
 			}
+
             idx += 2;
         }
         req->manual.isManual = 1;  // mark that a manual trigger is requested
@@ -2215,44 +3061,44 @@ static int parse_master_request(const char *json, masterRequest *req) {
     return 0;
 }
 
-static int parse_master_request_old(const char *json, masterRequest *req) {
-    jsmn_parser parser;
-    jsmntok_t tokens[64];
-    jsmn_init(&parser);
-    int num = jsmn_parse(&parser, json, strlen(json), tokens, sizeof(tokens)/sizeof(tokens[0]));
-    if (num < 0) return -1;
-
-    req->cmd = CMD_UNKNOWN;
-    memset(&req->task, 0, sizeof(TaskInfo));
-    jsmntok_t *task_tok = NULL;
-
-    for (int i = 1; i < num; i++) {
-        if (jsoneq(json, &tokens[i], "event") == 0) {
-            jsmntok_t *val = &tokens[i+1];
-            char buf[16];
-            snprintf(buf, sizeof(buf), "%.*s", val->end - val->start, json + val->start);
-            if (strcmp(buf, "heartbeat") == 0) req->cmd = CMD_HEARTBEAT;
-            else if (strcmp(buf, "reset") == 0) req->cmd = CMD_RESET;
-            else if (strcmp(buf, "clear_tasks") == 0) req->cmd = CMD_CLEAR_TASKS;
-            else if (strcmp(buf, "estop") == 0) req->cmd = CMD_ESTOP;
-            else if (strcmp(buf, "write_task") == 0) req->cmd = CMD_WRITE_TASK;
-            i++; // skip value
-        }
-        else if (jsoneq(json, &tokens[i], "task") == 0) {
-            // Remember the token for the task object (the value after "task")
-            task_tok = &tokens[i+1];
-            i++; // skip value
-        }
-    }
-
-    // Now handle the task if needed
-    if (req->cmd == CMD_WRITE_TASK && task_tok != NULL && task_tok->type == JSMN_OBJECT) {
-        // Parse the task object into req->task
-        parse_task_object(json, task_tok, req);
-    }
-
-    return 0;
-}
+//static int parse_master_request_old(const char *json, masterRequest *req) {
+//    jsmn_parser parser;
+//    jsmntok_t tokens[64];
+//    jsmn_init(&parser);
+//    int num = jsmn_parse(&parser, json, strlen(json), tokens, sizeof(tokens)/sizeof(tokens[0]));
+//    if (num < 0) return -1;
+//
+//    req->cmd = CMD_UNKNOWN;
+//    memset(&req->task, 0, sizeof(TaskInfo));
+//    jsmntok_t *task_tok = NULL;
+//
+//    for (int i = 1; i < num; i++) {
+//        if (jsoneq(json, &tokens[i], "event") == 0) {
+//            jsmntok_t *val = &tokens[i+1];
+//            char buf[16];
+//            snprintf(buf, sizeof(buf), "%.*s", val->end - val->start, json + val->start);
+//            if (strcmp(buf, "heartbeat") == 0) req->cmd = CMD_HEARTBEAT;
+//            else if (strcmp(buf, "reset") == 0) req->cmd = CMD_RESET;
+//            else if (strcmp(buf, "clear_tasks") == 0) req->cmd = CMD_CLEAR_TASKS;
+//            else if (strcmp(buf, "estop") == 0) req->cmd = CMD_ESTOP;
+//            else if (strcmp(buf, "write_task") == 0) req->cmd = CMD_WRITE_TASK;
+//            i++; // skip value
+//        }
+//        else if (jsoneq(json, &tokens[i], "task") == 0) {
+//            // Remember the token for the task object (the value after "task")
+//            task_tok = &tokens[i+1];
+//            i++; // skip value
+//        }
+//    }
+//
+//    // Now handle the task if needed
+//    if (req->cmd == CMD_WRITE_TASK && task_tok != NULL && task_tok->type == JSMN_OBJECT) {
+//        // Parse the task object into req->task
+//        parse_task_object(json, task_tok, req);
+//    }
+//
+//    return 0;
+//}
 
 static void parse_task_object(const char *json, jsmntok_t *task_tok, masterRequest *req) {
     TaskInfo temp = {0};   // zero-initialized
@@ -2264,6 +3110,13 @@ static void parse_task_object(const char *json, jsmntok_t *task_tok, masterReque
         jsmntok_t *val = &task_tok[idx+1];
         if (jsoneq(json, key, "plotID") == 0) {
             temp.plotID = (uint8_t)parse_int(json, val);
+        } else if(jsoneq(json, key, "taskID") == 0){
+        	int len = val->end - val->start;
+        	if (len > 0 && len < TASK_ID_BYTE_COUNT) {
+        	    snprintf((char*)temp.taskID, sizeof(temp.taskID), "%.*s", len, json + val->start);
+        	} else {
+        	    temp.taskID[0] = '\0'; // Empty string
+        	}
         } else if (jsoneq(json, key, "duration") == 0) {
             temp.duration = (uint32_t)parse_int(json, val);
         } else if (jsoneq(json, key, "TargetEC") == 0) {
@@ -2287,7 +3140,11 @@ static void parse_task_object(const char *json, jsmntok_t *task_tok, masterReque
     // (You may want to validate fields here, e.g., plotID != 0, duration > 0)
     if (temp.plotID != 0 && temp.duration > 0) {
         memcpy(&req->task, &temp, sizeof(TaskInfo));
-    } else {
+    } else if(req->cmd == CMD_CLEAR_TASK){
+    	memcpy(&req->task, &temp, sizeof(TaskInfo));
+    }
+    else
+    {
         // Optionally set req->cmd to CMD_UNKNOWN or handle error
         req->cmd = CMD_UNKNOWN;
     }
@@ -2301,20 +3158,19 @@ static int jsoneq(const char *json, jsmntok_t *tok, const char *s){
 	return -1;
 }
 
-static int parse_int(const char *json, jsmntok_t *tok)
+static uint32_t parse_int(const char *json, jsmntok_t *tok)
 {
-    int val = 0;
-    int sign = 1;
+    uint32_t val = 0;
     const char *p = json + tok->start;
     const char *end = json + tok->end;
-    if (*p == '-') { sign = -1; p++; }
+    if (*p == '-') {p++; }
     for (; p < end; p++) {
         if (*p >= '0' && *p <= '9')
             val = val * 10 + (*p - '0');
         else
             break;
     }
-    return val * sign;
+    return val;
 }
 
 static float parse_float(const char *json, jsmntok_t *tok) {
@@ -2361,7 +3217,7 @@ static float parse_float(const char *json, jsmntok_t *tok) {
 
     result *= sign;
     if (exponent != 0) {
-        result *= pow10(exp_sign * exponent);
+        result *= powhere10(exp_sign * exponent);
     }
     return result;
 }
@@ -2382,21 +3238,36 @@ static void executeCommand(void){
 	switch(MachineSetting.TCPCom.MasterRequest.cmd){
 	case CMD_HEARTBEAT:
 		memset(&MachineSetting.TCPCom.MasterRequest.task, 0,  sizeof(TaskInfo));
+		memset(&MachineSetting.TCPCom.MasterRequest.manual, 0,  sizeof(ManualEvent));
 		break;
 	case CMD_RESET:
 		memset(&MachineSetting.TCPCom.MasterRequest.task, 0,  sizeof(TaskInfo));
+		memset(&MachineSetting.TCPCom.MasterRequest.manual, 0,  sizeof(ManualEvent));
 		MachineSetting.isAbort = 1;
+		break;
+	case CMD_CLEAR_TASK:
+		MachineSetting.isAbort = 1;
+		MoveTaskToTaskHistory(MachineSetting.TCPCom.MasterRequest.task.taskID);
+		TaskInfoFIFO_Remove(&MachineSetting.TaskProxyBuffer.InfoFIFO,MachineSetting.TCPCom.MasterRequest.task.taskID);
+		memset(&MachineSetting.TCPCom.MasterRequest.task, 0,  sizeof(TaskInfo));
+		memset(&MachineSetting.TCPCom.MasterRequest.manual, 0,  sizeof(ManualEvent));
 		break;
 	case CMD_CLEAR_TASKS:
 		memset(&MachineSetting.TCPCom.MasterRequest.task, 0,  sizeof(TaskInfo));
+		memset(&MachineSetting.TCPCom.MasterRequest.manual, 0,  sizeof(ManualEvent));
+		MoveAllTasksToTaskHistory();
 		TaskInfoFIFO_RemoveAll(&MachineSetting.TaskProxyBuffer.InfoFIFO);
 		MachineSetting.isAbort = 1;
 		break;
 	case CMD_ESTOP:
 		memset(&MachineSetting.TCPCom.MasterRequest.task, 0,  sizeof(TaskInfo));
+		memset(&MachineSetting.TCPCom.MasterRequest.manual, 0,  sizeof(ManualEvent));
 		MachineSetting.isError = 1;
 		break;
 	case CMD_WRITE_TASK:
+		MachineSetting.TCPCom.MasterRequest.task.Hysterisis = 150;
+		MachineSetting.TCPCom.MasterRequest.task.plotID -= 1;
+		MachineSetting.TCPCom.MasterRequest.task.timeStamp = 0;
 		TaskInfoFIFO_Push(&MachineSetting.TaskProxyBuffer.InfoFIFO, &MachineSetting.TCPCom.MasterRequest.task);
 		memset(&MachineSetting.TCPCom.MasterRequest.task, 0,  sizeof(TaskInfo));
 		memset(&MachineSetting.TCPCom.MasterRequest.manual, 0,  sizeof(ManualEvent));
@@ -2409,14 +3280,18 @@ static void executeCommand(void){
 		memset(&MachineSetting.TCPCom.MasterRequest.manual, 0,  sizeof(ManualEvent));
 		break;
 	case CMD_MANUAL_ENTER:
-		MachineSetting.manualEvent.isManual = 1;
-		MachineSetting.isAbort = 1;
+		if(MachineSetting.manualEvent.isManual != 1){
+			MachineSetting.manualEvent.isManualNew = 1;
+			MachineSetting.isAbort = 1;
+		}
 		memset(&MachineSetting.TCPCom.MasterRequest.task, 0,  sizeof(TaskInfo));
 		memset(&MachineSetting.TCPCom.MasterRequest.manual, 0,  sizeof(ManualEvent));
 		break;
 	case CMD_MANUAL_EXIT:
-		MachineSetting.manualEvent.isManual = 0;
-		MachineSetting.isAbort = 1;
+		if(MachineSetting.manualEvent.isManual != 0){
+			MachineSetting.manualEvent.isManualNew = 0;
+			MachineSetting.isAbort = 1;
+		}
 		memset(&MachineSetting.TCPCom.MasterRequest.task, 0,  sizeof(TaskInfo));
 		memset(&MachineSetting.TCPCom.MasterRequest.manual, 0,  sizeof(ManualEvent));
 		break;
@@ -2425,43 +3300,56 @@ static void executeCommand(void){
 			switch (MachineSetting.TCPCom.MasterRequest.manual.triggerEvent){
 			case STATE_MANUAL_MIXED_WATER_WATERING:
 				MachineSetting.manualEvent.triggerEvent = STATE_MANUAL_MIXED_WATER_WATERING;
-				MachineSetting.TimeOut[STATE_MANUAL_MIXED_WATER_WATERING] = MachineSetting.TCPCom.MasterRequest.manual.TimeOut;
+				MachineSetting.manualEvent.plotID = MachineSetting.TCPCom.MasterRequest.manual.plotID-1;
+				MachineSetting.manualEvent.TimeOut = MachineSetting.TCPCom.MasterRequest.manual.TimeOut;
+				memcpy(MachineSetting.manualEvent.taskID, MachineSetting.TCPCom.MasterRequest.manual.taskID, TASK_ID_BYTE_COUNT);
 				break;
 			case STATE_MANUAL_WATER_RESERVOIR_REFILL:
 				MachineSetting.manualEvent.triggerEvent = STATE_MANUAL_WATER_RESERVOIR_REFILL;
+				memcpy(MachineSetting.manualEvent.taskID, MachineSetting.TCPCom.MasterRequest.manual.taskID, TASK_ID_BYTE_COUNT);
 				break;
 			case STATE_MANUAL_CLEAN_WATER_WATERING:
 				MachineSetting.manualEvent.triggerEvent = STATE_MANUAL_CLEAN_WATER_WATERING;
-				MachineSetting.TimeOut[STATE_MANUAL_CLEAN_WATER_WATERING] = MachineSetting.TCPCom.MasterRequest.manual.TimeOut;
+				MachineSetting.manualEvent.plotID = MachineSetting.TCPCom.MasterRequest.manual.plotID-1;
+				MachineSetting.manualEvent.TimeOut = MachineSetting.TCPCom.MasterRequest.manual.TimeOut;
+				memcpy(MachineSetting.manualEvent.taskID, MachineSetting.TCPCom.MasterRequest.manual.taskID, TASK_ID_BYTE_COUNT);
 				break;
 			case STATE_MANUAL_CLEAN_WATER_FILLING_LOWER_EC:
 				MachineSetting.manualEvent.triggerEvent = STATE_MANUAL_CLEAN_WATER_FILLING_LOWER_EC;
-				MachineSetting.TargetEC = MachineSetting.TCPCom.MasterRequest.manual.TargetEC;
+				MachineSetting.manualEvent.TargetEC = MachineSetting.TCPCom.MasterRequest.manual.TargetEC;
+				memcpy(MachineSetting.manualEvent.taskID, MachineSetting.TCPCom.MasterRequest.manual.taskID, TASK_ID_BYTE_COUNT);
 				break;
 			case STATE_MANUAL_WATER_FILLING_TO_MIX1_HIGHSENSOR:
 				MachineSetting.manualEvent.triggerEvent = STATE_MANUAL_WATER_FILLING_TO_MIX1_HIGHSENSOR;
+				memcpy(MachineSetting.manualEvent.taskID, MachineSetting.TCPCom.MasterRequest.manual.taskID, TASK_ID_BYTE_COUNT);
 				break;
 			case STATE_MANUAL_FERTILIZER_ADDING:
 				MachineSetting.manualEvent.triggerEvent = STATE_MANUAL_FERTILIZER_ADDING;
-				MachineSetting.TargetEC = MachineSetting.TCPCom.MasterRequest.manual.TargetEC;
+				MachineSetting.manualEvent.TargetEC = MachineSetting.TCPCom.MasterRequest.manual.TargetEC;
+				memcpy(MachineSetting.manualEvent.taskID, MachineSetting.TCPCom.MasterRequest.manual.taskID, TASK_ID_BYTE_COUNT);
 				break;
 			case STATE_MANUAL_OVERFLOW_RECOVERY:
 				MachineSetting.manualEvent.triggerEvent = STATE_MANUAL_OVERFLOW_RECOVERY;
+				memcpy(MachineSetting.manualEvent.taskID, MachineSetting.TCPCom.MasterRequest.manual.taskID, TASK_ID_BYTE_COUNT);
 				break;
 			case STATE_MANUAL_FILL_FERTILIZER_TANK:
 				MachineSetting.manualEvent.triggerEvent = STATE_MANUAL_FILL_FERTILIZER_TANK;
+				memcpy(MachineSetting.manualEvent.taskID, MachineSetting.TCPCom.MasterRequest.manual.taskID, TASK_ID_BYTE_COUNT);
 				break;
 			case STATE_MANUAL_FILL_PESTICIDE_TANK:
 				MachineSetting.manualEvent.triggerEvent = STATE_MANUAL_FILL_PESTICIDE_TANK;
+				memcpy(MachineSetting.manualEvent.taskID, MachineSetting.TCPCom.MasterRequest.manual.taskID, TASK_ID_BYTE_COUNT);
 				break;
 			case STATE_MANUAL_DISSOLVE_SOLID_FERTILIZER:
 				MachineSetting.manualEvent.triggerEvent = STATE_MANUAL_DISSOLVE_SOLID_FERTILIZER;
-				MachineSetting.TimeOut[STATE_MANUAL_DISSOLVE_SOLID_FERTILIZER] = MachineSetting.TCPCom.MasterRequest.manual.TimeOut;
+				MachineSetting.manualEvent.TimeOut = MachineSetting.TCPCom.MasterRequest.manual.TimeOut;
+				memcpy(MachineSetting.manualEvent.taskID, MachineSetting.TCPCom.MasterRequest.manual.taskID, TASK_ID_BYTE_COUNT);
 				break;
 			default:
 				break;
 			}
 		}
+		memset(&MachineSetting.TCPCom.MasterRequest.task, 0,  sizeof(TaskInfo));
 		memset(&MachineSetting.TCPCom.MasterRequest.manual, 0,  sizeof(ManualEvent));
 		break;
 	case CMD_UNKNOWN:
@@ -2506,7 +3394,7 @@ static void ModbusTransmitSwitchDevice(void){
 			}
 			break;
 		case 10:
-			if (mb2.modbusState == MB_STATE_TIMEOUT || mb2.modbusState == MB_STATE_ERROR){
+			if (mb2.modbusState == MB_STATE_ERROR){
 				if (mb2.modbusReadQueue.requestQueue[mb2.modbusReadQueue.head].errorCount>5){
 					MachineSetting.generalSetting.readingEC.modbusSetting.isError = 1;
 				}
@@ -2514,39 +3402,25 @@ static void ModbusTransmitSwitchDevice(void){
 				modbusSwitchCase = 100;
 			}
 			if(mb2.modbusState == MB_STATE_RX_COMPLETE){
-				uint32_t slave1EC32 = mb2.modbusTransaction.data[0]<<16|mb2.modbusTransaction.data[1];
+				uint32_t slave1EC32 = mb2.modbusTransaction.data[0];
+				MachineSetting.generalSetting.readingEC.modbusSetting.value = slave1EC32;
 				float slave1EC = 0;
-				memcpy(&slave1EC, &slave1EC32, sizeof(uint32_t));
-				slave1EC = MachineSetting.generalSetting.readingEC.modbusSetting.factor*slave1EC;
+
+				slave1EC = MachineSetting.generalSetting.readingEC.modbusSetting.factor*slave1EC32;
+
 				if(MachineSetting.generalSetting.readingEC.modbusSetting.isError != 0){
 					MachineSetting.generalSetting.readingEC.MeanEC = slave1EC;
 				}
 				else{
-					MachineSetting.generalSetting.readingEC.MeanEC = MachineSetting.generalSetting.readingEC.MeanEC*0.2 + slave1EC*0.8;
+					MachineSetting.generalSetting.readingEC.MeanEC = MachineSetting.generalSetting.readingEC.MeanEC*0+ slave1EC*1;
 				}
-
+				MachineSetting.generalSetting.readingEC.modbusSetting.isError = 0;
 				mb2.modbusReadQueue.head = (mb2.modbusReadQueue.head +1)%(mb2.modbusReadQueue.count);
 				modbusSwitchCase = 100;
 			}
 			break;
 		case 11:
-			if (mb2.modbusState == MB_STATE_TIMEOUT || mb2.modbusState == MB_STATE_ERROR){
-				if (mb2.modbusReadQueue.requestQueue[mb2.modbusReadQueue.head].errorCount>5){
-					MachineSetting.generalSetting.Fert.Fert[0].modbusSetting.isError;
-				}
-				mb2.modbusReadQueue.head = (mb2.modbusReadQueue.head +1)%(mb2.modbusReadQueue.count);
-				modbusSwitchCase = 100;
-			}
-			if(mb2.modbusState == MB_STATE_RX_COMPLETE){
-				float mb2slave2AccumulateVolumeA = (float)((uint32_t)mb2.modbusTransaction.data[0] << 16 | mb2.modbusTransaction.data[1]);
-				mb2slave2AccumulateVolumeA = mb2slave2AccumulateVolumeA*MachineSetting.generalSetting.Fert.Fert[0].modbusSetting.factor;
-				MachineSetting.generalSetting.Fert.Fert[0].modbusSetting.value = mb2slave2AccumulateVolumeA;
-				mb2.modbusReadQueue.head = (mb2.modbusReadQueue.head +1)%(mb2.modbusReadQueue.count);
-				modbusSwitchCase = 100;
-			}
-			break;
-		case 12:
-			if (mb2.modbusState == MB_STATE_TIMEOUT || mb2.modbusState == MB_STATE_ERROR){
+			if (mb2.modbusState == MB_STATE_ERROR){
 				if (mb2.modbusReadQueue.requestQueue[mb2.modbusReadQueue.head].errorCount>5){
 					MachineSetting.generalSetting.Fert.Fert[0].modbusSetting.isError = 1;
 				}
@@ -2554,11 +3428,29 @@ static void ModbusTransmitSwitchDevice(void){
 				modbusSwitchCase = 100;
 			}
 			if(mb2.modbusState == MB_STATE_RX_COMPLETE){
-				float mb2slave3AccumulateVolumeB = (float)((uint32_t)mb2.modbusTransaction.data[0] << 16 | mb2.modbusTransaction.data[1]);
-				mb2slave3AccumulateVolumeB = mb2slave3AccumulateVolumeB*MachineSetting.generalSetting.Fert.Fert[0].modbusSetting.factor;
+				float mb2slave2AccumulateVolumeA = (float)((uint32_t)mb2.modbusTransaction.data[0]  | mb2.modbusTransaction.data[1] << 16);
+				mb2slave2AccumulateVolumeA = mb2slave2AccumulateVolumeA*MachineSetting.generalSetting.Fert.Fert[0].modbusSetting.factor;
+				MachineSetting.generalSetting.Fert.Fert[0].modbusSetting.value = mb2slave2AccumulateVolumeA;
+				mb2.modbusReadQueue.head = (mb2.modbusReadQueue.head +1)%(mb2.modbusReadQueue.count);
+				modbusSwitchCase = 100;
+				MachineSetting.generalSetting.Fert.Fert[0].modbusSetting.isError = 0;
+			}
+			break;
+		case 12:
+			if (mb2.modbusState == MB_STATE_ERROR){
+				if (mb2.modbusReadQueue.requestQueue[mb2.modbusReadQueue.head].errorCount>5){
+					MachineSetting.generalSetting.Fert.Fert[1].modbusSetting.isError = 1;
+				}
+				mb2.modbusReadQueue.head = (mb2.modbusReadQueue.head +1)%(mb2.modbusReadQueue.count);
+				modbusSwitchCase = 100;
+			}
+			if(mb2.modbusState == MB_STATE_RX_COMPLETE){
+				float mb2slave3AccumulateVolumeB = ((uint32_t)mb2.modbusTransaction.data[0]<<16 | mb2.modbusTransaction.data[1]);
+				mb2slave3AccumulateVolumeB = mb2slave3AccumulateVolumeB*MachineSetting.generalSetting.Fert.Fert[1].modbusSetting.factor;
 				MachineSetting.generalSetting.Fert.Fert[1].modbusSetting.value = mb2slave3AccumulateVolumeB;
 				mb2.modbusReadQueue.head = (mb2.modbusReadQueue.head +1)%(mb2.modbusReadQueue.count);
 				modbusSwitchCase = 100;
+				MachineSetting.generalSetting.Fert.Fert[1].modbusSetting.isError = 0;
 			}
 			break;
 		case 20:
@@ -2581,133 +3473,6 @@ static void ModbusTransmitSwitchDevice(void){
 			break;
 		}
 		ModbusMaster_MonitorTransceive(&mb2);
-}
-
-static void TestingIO(void){
-	if (IOTestArray[0] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_VALVE], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_VALVE], GPIO_PIN_RESET);
-	}
-
-	// Pin 1  -> Fert[1].out[FERTOUT_FERT_VALVE]
-	if (IOTestArray[1] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_FERT_VALVE], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_FERT_VALVE], GPIO_PIN_RESET);
-	}
-
-	// Pin 4  -> Fert[0].out[FERTOUT_FERT_PUMP]
-	if (IOTestArray[2] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_PUMP], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FERT_PUMP], GPIO_PIN_RESET);
-	}
-
-	// Pin 5  -> Fert[1].out[FERTOUT_FERT_PUMP]
-	if (IOTestArray[3] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_FERT_PUMP], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_FERT_PUMP], GPIO_PIN_RESET);
-	}
-
-	// Pin 6  -> Fert[0].out[FERTOUT_PROPELLER]
-	if (IOTestArray[4] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_PROPELLER], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_PROPELLER], GPIO_PIN_RESET);
-	}
-
-	// Pin 7  -> Fert[1].out[FERTOUT_PROPELLER]
-	if (IOTestArray[5] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_PROPELLER], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_PROPELLER], GPIO_PIN_RESET);
-	}
-
-	// Pin 8  -> ValveWaterSource
-	if (IOTestArray[6] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveWaterSource], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveWaterSource], GPIO_PIN_RESET);
-	}
-
-	// Pin 9  -> ValveOutMix1
-	if (IOTestArray[7] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix1], GPIO_PIN_RESET);
-	}
-
-	// Pin 10 -> ValveInMix1
-	if (IOTestArray[8] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix1], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix1], GPIO_PIN_RESET);
-	}
-
-	// Pin 11 -> ValveOutMix2
-	if (IOTestArray[9] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix2], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveOutMix2], GPIO_PIN_RESET);
-	}
-
-	// Pin 12 -> ValveInMix2
-	if (IOTestArray[10] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix2], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[ValveInMix2], GPIO_PIN_RESET);
-	}
-
-	// Pin 13 -> Fert[0].out[FERTOUT_FILL_VALVE]
-	if (IOTestArray[11] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FILL_VALVE], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[0].out[FERTOUT_FILL_VALVE], GPIO_PIN_RESET);
-	}
-
-	// Pin 14 -> Fert[1].out[FERTOUT_FILL_VALVE]
-	if (IOTestArray[12] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_FILL_VALVE], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Fert.Fert[1].out[FERTOUT_FILL_VALVE], GPIO_PIN_RESET);
-	}
-
-	// Pin 15 -> ValveOut[0]
-	if (IOTestArray[13] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.ValveOut[0], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.ValveOut[0], GPIO_PIN_RESET);
-	}
-
-	// Pin 16 -> ValveOut[1]
-	if (IOTestArray[14] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.ValveOut[1], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.ValveOut[1], GPIO_PIN_RESET);
-	}
-
-	// Pin 17 -> ValveOut[2]
-	if (IOTestArray[15] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.ValveOut[2], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.ValveOut[2], GPIO_PIN_RESET);
-	}
-
-	// Pin 22 -> WaterReservoirPump
-	if (IOTestArray[16] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[WaterReservoirPump], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[WaterReservoirPump], GPIO_PIN_RESET);
-	}
-
-	// Pin 23 -> FertigationPump
-	if (IOTestArray[17] != 0) {
-	    WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_SET);
-	} else {
-	    WriteOutput(MachineSetting.generalSetting.Outputs.BasicOut[FertigationPump], GPIO_PIN_RESET);
-	}
 }
 
 static const char* state_to_string(machineState state) {
@@ -2782,21 +3547,53 @@ static int build_status_json(char *buffer, size_t buf_size) {
 
     TaskInfoFIFO *fifo = &MachineSetting.TaskProxyBuffer.InfoFIFO;
     uint8_t total_tasks = fifo->count;
-    uint8_t tasks_to_show = total_tasks > 5 ? 5 : total_tasks;
+    TaskHistoryFIFO *historyfifo = &MachineSetting.TaskProxyBuffer.HistoryFIFO;
+    uint8_t total_taskhistorys = historyfifo->count;
+    StateHistoryFIFO *statehistoryfifo = &MachineSetting.stateHistoryFIFO;
+    uint8_t total_statehistorys = statehistoryfifo->count;
     char ec_str[16];
     int len = 0;
     float_to_string(MachineSetting.generalSetting.readingEC.MeanEC, ec_str);
 
     len += snprintf(buffer + len, buf_size - len,
-                    "{\"state\":\"%s\",\"manualMode\":%d,\"taskCount\":%d,\"currentEC\":%s,\"tasks\":[",
+                    "{\"state\":\"%s\",\"stateElapsedTime\":%u,\"currentTime\":%u,\"scanTime\":%u,\"manualMode\":%d,\"taskCount\":%d,\"currentEC\":%s,",
                     state_to_string(MachineSetting.MachineState),
+					(unsigned int)MachineSetting.ElapsedTime,
+					(unsigned int)MachineSetting.currentTick,
+					(unsigned int)MachineSetting.scanTime,
                     MachineSetting.manualEvent.isManual ? 1 : 0,
                     total_tasks,
                     ec_str);
     if (len >= buf_size) return -1;
+    if(total_tasks != 0){
+		float_to_string(fifo->FIFO[fifo->head].TargetEC, ec_str);
+		len += snprintf(buffer + len, buf_size - len,
+				"\"currentTask\":{\"taskID\":\"%s\",\"plotID\":%u,\"duration\":%u,\"elapsedTime\":%u,\"targetEC\":%s,\"ecRatio\":[",
+							(char*) fifo->FIFO[fifo->head].taskID,
+							(unsigned int)fifo->FIFO[fifo->head].plotID,
+							(unsigned int)fifo->FIFO[fifo->head].duration,
+							(unsigned int)fifo->FIFO[fifo->head].elapsedTime,
+							ec_str);
+		if (len >= buf_size) return -1;
+		uint8_t fert_count = MachineSetting.generalSetting.Fert.FertCount;
+		for (int j = 0; j < fert_count; j++) {
+			len += snprintf(buffer + len, buf_size - len, "%d", fifo->FIFO[fifo->head].ECRatio[j]);
+			if (j < fert_count - 1) {
+				len += snprintf(buffer + len, buf_size - len, ",");
+				if (len >= buf_size) return -1;
+			}
+		}
+		// If fert_count < MAX_FERT_TYPE, remaining ratios are omitted (they are zero anyway)
+		len += snprintf(buffer + len, buf_size - len, "]},");
+		if (len >= buf_size) return -1;
+    }
+    len += snprintf(buffer + len, buf_size - len,
+					"\"tasks\":[");
+    if (len >= buf_size) return -1;
 
     uint8_t idx = fifo->head;
-    for (int i = 0; i < tasks_to_show; i++) {
+
+    for (int i = 0; i < total_tasks; i++) {
         TaskInfo *t = &fifo->FIFO[idx];
 
         // Convert TargetEC to string without %f
@@ -2804,42 +3601,77 @@ static int build_status_json(char *buffer, size_t buf_size) {
         float_to_string(t->TargetEC, ec_str);
 
         len += snprintf(buffer + len, buf_size - len,
-                        "{\"plotID\":%d,\"duration\":%d,\"elapsedTime\":%d,\"TargetEC\":%s,\"ECRatio\":[",
-                        t->plotID, (unsigned long)t->duration, (unsigned long)t->elapsedTime, ec_str);
+                        "\"%s\"",
+                        (char*)(t->taskID));
         if (len >= buf_size) return -1;
 
         // Use active fertilizer count (not MAX_FERT_TYPE)
-        uint8_t fert_count = MachineSetting.generalSetting.Fert.FertCount;
-        for (int j = 0; j < fert_count; j++) {
-            len += snprintf(buffer + len, buf_size - len, "%d", t->ECRatio[j]);
-            if (j < fert_count - 1) {
-                len += snprintf(buffer + len, buf_size - len, ",");
-                if (len >= buf_size) return -1;
-            }
-        }
-        // If fert_count < MAX_FERT_TYPE, remaining ratios are omitted (they are zero anyway)
-        len += snprintf(buffer + len, buf_size - len, "]}");
-        if (len >= buf_size) return -1;
+//        uint8_t fert_count = MachineSetting.generalSetting.Fert.FertCount;
+//        for (int j = 0; j < fert_count; j++) {
+//            len += snprintf(buffer + len, buf_size - len, "%d", t->ECRatio[j]);
+//            if (j < fert_count - 1) {
+//                len += snprintf(buffer + len, buf_size - len, ",");
+//                if (len >= buf_size) return -1;
+//            }
+//        }
+//        // If fert_count < MAX_FERT_TYPE, remaining ratios are omitted (they are zero anyway)
+//        len += snprintf(buffer + len, buf_size - len, "]}");
+//        if (len >= buf_size) return -1;
 
-        if (i < tasks_to_show - 1) {
+        if (i < total_tasks- 1) {
             len += snprintf(buffer + len, buf_size - len, ",");
             if (len >= buf_size) return -1;
         }
         idx = (idx + 1) % MAX_TASK_COUNT;
     }
-
-    len += snprintf(buffer + len, buf_size - len, "],\"errors\":[");
-        if (len >= buf_size) return -1;
-        for (int i = 0; i < MachineSetting.ErrorCount; i++) {
-            len += snprintf(buffer + len, buf_size - len, "%d", MachineSetting.ErrorArray[i]);
-            if (i < MachineSetting.ErrorCount - 1) {
-                len += snprintf(buffer + len, buf_size - len, ",");
-                if (len >= buf_size) return -1;
-            }
-        }
-        len += snprintf(buffer + len, buf_size - len, "]}");
-        if (len >= buf_size) return -1;
-
+    len += snprintf(buffer +len, buf_size-len, "],\"stateHistory\":[");
+    for(int i = 0; i< total_statehistorys; i++){
+    	len += snprintf(buffer + len, buf_size - len,
+			"{\"taskID\":\"%s\",\"elapsedTime\":%u,\"exitTimeStamp\":%u,\"exitCode\":%u}",
+						(char*) statehistoryfifo->FIFO[(statehistoryfifo->head +i)%MAX_STATE_HISTORY_COUNT].taskID,
+						(unsigned int)statehistoryfifo->FIFO[(statehistoryfifo->head +i)%MAX_STATE_HISTORY_COUNT].elapsedTime,
+						(unsigned int)statehistoryfifo->FIFO[(statehistoryfifo->head +i)%MAX_STATE_HISTORY_COUNT].exitTimeStamp,
+						(unsigned int)statehistoryfifo->FIFO[(statehistoryfifo->head +i)%MAX_STATE_HISTORY_COUNT].exitCode);
+    	if (len >= buf_size) return -1;
+    	if(i < total_statehistorys-1){
+    		len += snprintf(buffer + len, buf_size - len, ",");
+    		if (len >= buf_size) return -1;
+    	}
+    }
+    len += snprintf(buffer +len, buf_size-len, "],\"taskHistory\":[");
+	for(int i = 0; i< total_taskhistorys; i++){
+		len += snprintf(buffer + len, buf_size - len,
+			"{\"taskID\":\"%s\",\"incompleteDuration\":%u,\"start\":%u,\"end\":%u}",
+						(char*) historyfifo->FIFO[(historyfifo->head +i)%MAX_TASK_HISTORY_COUNT].taskID,
+						(unsigned int)historyfifo->FIFO[(historyfifo->head +i)%MAX_TASK_HISTORY_COUNT].incompleteDuration,
+						(unsigned int)historyfifo->FIFO[(historyfifo->head +i)%MAX_TASK_HISTORY_COUNT].start,
+						(unsigned int)historyfifo->FIFO[(historyfifo->head +i)%MAX_TASK_HISTORY_COUNT].end);
+		if (len >= buf_size) return -1;
+		if(i < total_taskhistorys-1){
+			len += snprintf(buffer + len, buf_size - len, ",");
+			if (len >= buf_size) return -1;
+		}
+	}
+    len += snprintf(buffer + len, buf_size - len, "],\"warnings\":[");
+    for(int i = 0; i < WARN_COUNT;i++){
+    	if(MachineSetting.WarningArray[i] != 0){
+    		len += snprintf(buffer+len, buf_size-len, "1");
+    	}
+    	else{
+    		len += snprintf(buffer+len, buf_size-len, "0");
+    	}
+    	if(len>=buf_size) return -1;
+    	if(i < WARN_COUNT-1){
+    		len += snprintf(buffer + len, buf_size - len, ",");
+    		if (len >= buf_size) return -1;
+    	}
+    }
+    len += snprintf(buffer + len, buf_size - len, "],\"errors\":");
+	if (len >= buf_size) return -1;
+	len += snprintf(buffer + len, buf_size - len, "%u}", (unsigned int)MachineSetting.ErrorCode);
+	if (len >= buf_size) return -1;
+	len += snprintf(buffer + len, buf_size - len, "\r\n");
+	if (len >= buf_size) return -1;
 //    len += snprintf(buffer + len, buf_size - len, ",\"warnings\":[]}");
 //    if (len >= buf_size) return -1;
 
@@ -2847,6 +3679,13 @@ static int build_status_json(char *buffer, size_t buf_size) {
 }
 
 static uint8_t TaskInfoFIFO_Push(TaskInfoFIFO *fifo, const TaskInfo *task) {
+
+    for(int i = 0; i< fifo->count; i++){
+    	if(memcmp(fifo->FIFO[(fifo->head + i)% MAX_TASK_COUNT].taskID,task->taskID, TASK_ID_BYTE_COUNT) == 0 && i != 0){
+    		fifo->FIFO[(fifo->head + i)%MAX_TASK_COUNT] = *task;
+    		return 1;
+    	}
+    }
     if (fifo->count >= MAX_TASK_COUNT) return 0;
     fifo->FIFO[fifo->tail] = *task;
     fifo->tail = (fifo->tail + 1) % MAX_TASK_COUNT;
@@ -2860,26 +3699,154 @@ static void TaskInfoFIFO_RemoveFirst(TaskInfoFIFO *fifo) {
     fifo->count--;
 }
 
+static void TaskInfoFIFO_Remove(TaskInfoFIFO * fifo, uint8_t* taskid){
+	if(fifo->count == 0) return;
+	uint8_t found = 0;
+	for(int i = 0; i < fifo->count; i++){
+		if(found == 0){
+			if(memcmp(fifo->FIFO[(fifo->head +i)%(MAX_TASK_COUNT)].taskID, taskid,TASK_ID_BYTE_COUNT)== 0){
+				found = 1;
+			}
+		}
+		else{
+			memcpy(&fifo->FIFO[(fifo->head +i-1)%(MAX_TASK_COUNT)], &fifo->FIFO[(fifo->head +i)%(MAX_TASK_COUNT)], sizeof(TaskInfo));
+		}
+	}
+	if(found == 1){
+		fifo->count = fifo->count -1;
+		fifo->tail  = (fifo->tail + MAX_TASK_COUNT-1) % MAX_TASK_COUNT;
+	}
+}
+
 static void TaskInfoFIFO_RemoveAll(TaskInfoFIFO *fifo) {
     if (fifo->count == 0) return;
     fifo->count = 0;
     fifo->head = fifo -> tail;
 }
 
-static void AddErrorCode(uint16_t errorcode){
-	for(int i = 0; i<MachineSetting.ErrorCount; i++){
-		if(MachineSetting.ErrorArray[i] == errorcode){
-			return;
+static void MoveTaskToTaskHistory(uint8_t* taskid){
+	for(int i = 0; i < MachineSetting.TaskProxyBuffer.InfoFIFO.count; i++){
+		TaskHistory taskHistory = {0};
+		if(memcmp(taskid, MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].taskID, TASK_ID_BYTE_COUNT) == 0){
+			if(MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].duration > MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].elapsedTime){
+				taskHistory.incompleteDuration = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].duration - MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].elapsedTime;
+
+			}
+			else{
+				taskHistory.incompleteDuration = 0;
+			}
+			taskHistory.start = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].duration > MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].timeStamp;
+			taskHistory.end = HAL_GetTick();
+			memcpy(taskHistory.taskID, &MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].taskID, TASK_ID_BYTE_COUNT);
+			TaskHistoryFIFO_Push(&MachineSetting.TaskProxyBuffer.HistoryFIFO, &taskHistory);
+			break;
 		}
 	}
-	MachineSetting.ErrorArray[MachineSetting.ErrorCount++] = errorcode;
+}
+
+static void MoveAllTasksToTaskHistory(void){
+	for(int i = 0; i < MachineSetting.TaskProxyBuffer.InfoFIFO.count; i++){
+		TaskHistory taskHistory = {0};
+		if(MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].duration > MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].elapsedTime){
+			taskHistory.incompleteDuration = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].duration - MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].elapsedTime;
+
+		}
+		else{
+			taskHistory.incompleteDuration = 0;
+		}
+		taskHistory.start = MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].duration > MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].timeStamp;
+		taskHistory.end = HAL_GetTick();
+		memcpy(taskHistory.taskID, &MachineSetting.TaskProxyBuffer.InfoFIFO.FIFO[MachineSetting.TaskProxyBuffer.InfoFIFO.head + i].taskID, TASK_ID_BYTE_COUNT);
+		TaskHistoryFIFO_Push(&MachineSetting.TaskProxyBuffer.HistoryFIFO, &taskHistory);
+	}
+}
+
+static void TaskHistoryFIFO_Push(TaskHistoryFIFO *fifo, const TaskHistory *taskHistory){
+	fifo->FIFO[fifo->tail] = *taskHistory;
+	fifo->tail = (fifo->tail + 1) % MAX_TASK_HISTORY_COUNT;
+	if(fifo->count < MAX_TASK_HISTORY_COUNT){
+		fifo->count ++;
+	}
+	else{
+		fifo-> head = (fifo->head + 1) % MAX_TASK_HISTORY_COUNT;
+	}
+}
+
+static void StateHistoryFIFO_Push(StateHistoryFIFO *fifo, const StateHistory *stateHistory){
+	fifo->FIFO[fifo->tail] = *stateHistory;
+	fifo->tail = (fifo->tail + 1) % MAX_STATE_HISTORY_COUNT;
+	if(fifo->count < MAX_TASK_HISTORY_COUNT){
+		fifo->count ++;
+	}
+	else{
+		fifo-> head = (fifo->head + 1) % MAX_STATE_HISTORY_COUNT;
+	}
+}
+
+static void AppendStateHistory(uint16_t exitcode){
+	StateHistory stateHistory = {0};
+	stateHistory.elapsedTime = MachineSetting.ElapsedTime;
+	if(MachineSetting.manualEvent.isManual != 0){
+		memcpy(stateHistory.taskID, MachineSetting.manualEvent.taskID, TASK_ID_BYTE_COUNT);
+	}
+	stateHistory.exitTimeStamp = HAL_GetTick();
+	stateHistory.isManual = MachineSetting.manualEvent.isManual;
+	stateHistory.exitCode = exitcode;
+	StateHistoryFIFO_Push(&MachineSetting.stateHistoryFIFO, &stateHistory);
+}
+
+static void AddErrorCode(uint16_t errorcode){
+	MachineSetting.ErrorCode = errorcode;
 	return;
 }
 
 static void ClearErrorCode(void){
-	MachineSetting.ErrorCount = 0;
-	memset(MachineSetting.ErrorArray,0, sizeof(MachineSetting.ErrorArray));
+	MachineSetting.ErrorCode = 0;
 	return;
+}
+
+static void CheckWarningCondition(void){
+	if(ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[WaterResevoirLow]) == GPIO_PIN_SET || ReadInput(MachineSetting.generalSetting.Inputs.BasicIn[WaterResevoirWarning]) == GPIO_PIN_SET){
+		MachineSetting.WarningArray[WARN_WATER_RESERVOIR_NEED_REFILL] = 1;
+	}
+	else{
+		MachineSetting.WarningArray[WARN_WATER_RESERVOIR_NEED_REFILL] = 0;
+	}
+
+	if(ReadInput(MachineSetting.generalSetting.Fert.Fert[0].in[FERTIN_WARNING]) == GPIO_PIN_SET || ReadInput(MachineSetting.generalSetting.Fert.Fert[0].in[FERTIN_LOW]) == GPIO_PIN_SET){
+		MachineSetting.WarningArray[WARN_TANK_A_NEED_REFILL] = 1;
+	}
+	else{
+		MachineSetting.WarningArray[WARN_TANK_A_NEED_REFILL] = 0;
+	}
+
+	if(ReadInput(MachineSetting.generalSetting.Fert.Fert[1].in[FERTIN_WARNING]) == GPIO_PIN_SET || ReadInput(MachineSetting.generalSetting.Fert.Fert[1].in[FERTIN_LOW]) == GPIO_PIN_SET){
+		MachineSetting.WarningArray[WARN_TANK_B_NEED_REFILL] = 1;
+	}
+	else{
+		MachineSetting.WarningArray[WARN_TANK_B_NEED_REFILL] = 0;
+	}
+
+	if(MachineSetting.generalSetting.readingEC.modbusSetting.isError == 1){
+		MachineSetting.WarningArray[WARN_EC_SENSOR_FAULT] = 1;
+	}
+	else{
+		MachineSetting.WarningArray[WARN_EC_SENSOR_FAULT] = 0;
+	}
+
+	if(MachineSetting.generalSetting.Fert.Fert[0].modbusSetting.isError != 0){
+		MachineSetting.WarningArray[WARN_FLOW_METER_A_FAULT] = 1;
+	}
+	else{
+		MachineSetting.WarningArray[WARN_FLOW_METER_A_FAULT] = 0;
+	}
+
+	if(MachineSetting.generalSetting.Fert.Fert[1].modbusSetting.isError != 0){
+		MachineSetting.WarningArray[WARN_FLOW_METER_B_FAULT] = 1;
+	}
+	else{
+		MachineSetting.WarningArray[WARN_FLOW_METER_B_FAULT] = 0;
+	}
 }
 /* USER CODE END 4 */
 
