@@ -64,7 +64,7 @@ void Error_Handler(void);
 #define LOCAL_IN 16
 #define OUT_PER_SLAVE 16
 #define IN_PER_SLAVE 16
-#define MAX_SLAVE 5
+#define MAX_SLAVE 1
 #define OUT_PER_FERT 4
 #define IN_PER_FERT 4
 #define EC_SAMPLE_COUNT 30
@@ -80,10 +80,12 @@ void Error_Handler(void);
 #define SLAVE_RX_TIMEOUT 100
 #define SLAVE_INTERCHAR_TIMEOUT 10
 #define TCP_Buffer_MAX_Count 3072
+#define SLAVECOM_MAX_BYTE 128
 #define ERROR_ARRAY_COUNT 10
 #define NO_FLOW_DELAY 10000
 #define TASK_ID_BYTE_COUNT 40
 #define MAX_SLAVE_NO_CALL_FROM_MASTER_TIME 10000
+#define HEARTBEAT_DURATION 1000
 
 //typedef enum{
 //	TIMEOUT_MIXED_WATER_WATERING = 0,
@@ -112,6 +114,7 @@ typedef enum{
 	ValveOutMix1,
 	ValveInMix2,
 	ValveOutMix2,
+	HeartBeat,
 	BaseOutCount
 }OutputEnum;
 
@@ -241,6 +244,7 @@ typedef struct{
 
 typedef struct{
 	GPIO_PinState PinStatus;
+	uint32_t LastChangeTimeStamp;
 	uint8_t AccumulatedChange;
 	uint8_t IsBind;
 }RealPin;
@@ -353,10 +357,16 @@ typedef struct{
 	uint8_t ErrorCount;
 	uint8_t currentSlave;
 	uint8_t slaveCount;
-	uint8_t Buffer[128];
+	uint8_t Buffer[SLAVECOM_MAX_BYTE];
 	uint8_t bufferCount;
 }SlaveCommunication;
 
+typedef enum{
+	PLAN_LITE = 0,
+	PLAN_PRO,
+	PLAN_PRO_PLUS,
+	PLAN_TEST
+}PlanOption;
 
 typedef enum{
 	STATE_IDLE = 0,
@@ -393,8 +403,14 @@ typedef enum {
 	CMD_MANUAL_ENTER,      // new
 	CMD_MANUAL_EXIT,       // new
 	CMD_MANUAL_TRIGGER,    // new
+	CMD_WRITE_IO,
     CMD_UNKNOWN
 } MasterCommand;
+
+typedef struct{
+	uint8_t index;
+	GPIO_PinState IsOn;
+}WriteIO;
 
 typedef struct{
 	uint8_t isManual;
@@ -413,6 +429,7 @@ typedef struct {
     MasterCommand cmd;
     TaskInfo task;   // valid only if cmd == CMD_WRITE_TASK
     ManualEvent manual;
+    WriteIO writeIO;
 } masterRequest;
 
 typedef struct{
@@ -429,7 +446,12 @@ typedef struct{
 
 
 
+
+
 typedef struct{
+	PlanOption planSelection;
+	uint8_t RefillReservoirControl;
+	uint8_t IncludePlanReservoirAndIO;
 	uint8_t isAbort;
 	uint8_t isError;
 	ManualEvent manualEvent;
@@ -442,6 +464,7 @@ typedef struct{
 	uint32_t AddFertTimeStamp;
 	uint32_t ElapsedTime;
 	uint32_t currentTick;
+	uint32_t heartbeatTimeStamp;
 	uint32_t scanTime;
 	TaskProxy TaskProxyBuffer;
 	StateHistoryFIFO stateHistoryFIFO;
