@@ -86,6 +86,9 @@ void Error_Handler(void);
 #define TASK_ID_BYTE_COUNT 40
 #define MAX_SLAVE_NO_CALL_FROM_MASTER_TIME 10000
 #define HEARTBEAT_DURATION 1000
+#ifndef LEVEL_SENSOR_ANALOG
+#define LEVEL_SENSOR_ANALOG 1	//1 = tank levels from the analog sensors (PA1, PA4-PA7); 0 = digital level switches on the local inputs
+#endif
 
 //typedef enum{
 //	TIMEOUT_MIXED_WATER_WATERING = 0,

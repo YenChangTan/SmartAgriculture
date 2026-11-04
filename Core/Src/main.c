@@ -25,16 +25,30 @@
 #include <string.h>
 #include "jsmn.h"
 #include "modbus.h"
+#include "level_sensor.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef enum{
+	TANK_RESERVOIR = 0,
+	TANK_MIX1,
+	TANK_MIX2,
+	TANK_FERT_A,
+	TANK_FERT_B,
+	TANK_COUNT	//must equal ADC1 Number Of Conversion in CubeMX (5)
+}TankId;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+//0-2000 mm sensor, converter 20 mA = 3.0 V (raw 3723); zeroRaw is set per tank. Outside 434..3950 = fault.
+//Same settings as the TestAnalog bench project.
+#define TANK_SENSOR_DEFAULTS \
+	.samplePeriod = 100, .rawMin = 434, .rawMax = 3950, \
+	.fullRaw = 3723, .fullDepth = 2000.0f, \
+	.windowSize = 10, .failThreshold = 10, .recoverThreshold = 5, .restartTime = 5000, \
+	.isPointUsed = {1, 1, 1}, .hysteresis = 30.0f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -60,6 +74,23 @@ uint32_t currentTime = 0;
 uint32_t rand = 0;
 uint32_t testInt = 0;
 
+#if LEVEL_SENSOR_ANALOG
+LevelSensorBus levelBus;
+LevelSensor tank[TANK_COUNT];
+
+//Tank n reads ADC rank n+1. LOW/HIGH/LIMIT = Low/Warning/High on the reservoir and fertilizer tanks, Low/High/Limit on the mixing tanks.
+static const char *const tankName[TANK_COUNT] = {"Reservoir", "Mix1", "Mix2", "FertA", "FertB"};
+
+//Point depths (mm) are placeholders until each tank is measured.
+//zeroRaw: each sensor's mean raw out of the water, from the TestAnalog 5-minute capture on 2026-11-03.
+static const LevelSensorConfig tankConfig[TANK_COUNT] = {
+	[TANK_RESERVOIR] = {TANK_SENSOR_DEFAULTS, .rank = 0, .zeroRaw = 576, .pointDepth = {200.0f,  600.0f, 1800.0f}},	//PA1
+	[TANK_MIX1]      = {TANK_SENSOR_DEFAULTS, .rank = 1, .zeroRaw = 579, .pointDepth = {200.0f, 1500.0f, 1800.0f}},	//PA4
+	[TANK_MIX2]      = {TANK_SENSOR_DEFAULTS, .rank = 2, .zeroRaw = 567, .pointDepth = {200.0f, 1500.0f, 1800.0f}},	//PA5
+	[TANK_FERT_A]    = {TANK_SENSOR_DEFAULTS, .rank = 3, .zeroRaw = 563, .pointDepth = {100.0f,  300.0f,  900.0f}},	//PA6
+	[TANK_FERT_B]    = {TANK_SENSOR_DEFAULTS, .rank = 4, .zeroRaw = 564, .pointDepth = {100.0f,  300.0f,  900.0f}},	//PA7
+};
+#endif
 
 /* USER CODE END PV */
 
@@ -110,6 +141,11 @@ static void CheckWarningCondition(void);
 static void MoveAllTasksToTaskHistory(void);
 static void MoveTaskToTaskHistory(uint8_t* taskid);
 static void TaskInfoFIFO_Remove(TaskInfoFIFO * fifo, uint8_t* taskid);
+static void LevelSensorInit(void);
+static void LevelSensorUpdate(void);
+#if LEVEL_SENSOR_ANALOG
+static int build_level_json(char *buffer, size_t buf_size);
+#endif
 
 
 /* USER CODE END PFP */
@@ -148,6 +184,21 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
 		ModbusMaster_UART_RxCpltCallback(&mb2);
 	}
 }
+
+#if LEVEL_SENSOR_ANALOG
+//DMA finished the first / second half of the level buffer: add those samples to the running sums.
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc){
+	if(hadc == levelBus.hadc){
+		LevelSensorBus_HalfComplete(&levelBus);
+	}
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc){
+	if(hadc == levelBus.hadc){
+		LevelSensorBus_Complete(&levelBus);
+	}
+}
+#endif
 /* USER CODE END 0 */
 
 /**
@@ -187,6 +238,7 @@ int main(void)
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
   MachineSettingInit();
+  LevelSensorInit();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -223,6 +275,7 @@ int main(void)
 	  ModbusTransmitSwitchDevice();
 	  CheckTCP();
 	  IOListUpdate();
+	  LevelSensorUpdate();
 	  SlaveCom();
 	  CheckWarningCondition();
     /* USER CODE END WHILE */
@@ -6792,6 +6845,11 @@ static int build_status_json(char *buffer, size_t buf_size) {
 	}
     len += snprintf(buffer + len, buf_size - len, "],");
     if (len >= buf_size) return -1;
+#if LEVEL_SENSOR_ANALOG
+    int levelLen = build_level_json(buffer + len, buf_size - len);
+    if (levelLen < 0) return -1;
+    len += levelLen;
+#endif
     if(total_tasks != 0){
 		float_to_string(fifo->FIFO[fifo->head].TargetEC, ec_str);
 		len += snprintf(buffer + len, buf_size - len,
@@ -7085,6 +7143,80 @@ static void CheckWarningCondition(void){
 		MachineSetting.WarningArray[WARN_FLOW_METER_B_FAULT] = 0;
 	}
 }
+
+#if LEVEL_SENSOR_ANALOG
+//The analog point replaces the digital level switch at the same input index, with the same meaning: SET = water below the point
+static void LevelPointToInput(const LevelSensor *sensor, LevelSensorPoint point, uint8_t inputIndex){
+	RealPin *pin = &MachineSetting.generalSetting.Inputs.RealPinState[inputIndex];
+	pin->PinStatus = LevelSensor_ReadPoint(sensor, point);
+	pin->AccumulatedChange = 0;
+}
+#endif
+
+static void LevelSensorInit(void){
+#if LEVEL_SENSOR_ANALOG
+	LevelSensorBus_Init(&levelBus, &hadc1, TANK_COUNT);
+	for(uint8_t n = 0; n < TANK_COUNT; n++){
+		LevelSensor_Init(&tank[n], &tankConfig[n]);
+		LevelSensorBus_Add(&levelBus, &tank[n]);
+	}
+	//on failure every tank stays "wait" in the status JSON
+	LevelSensorBus_Start(&levelBus);
+#endif
+}
+
+//Called after IOListUpdate() so the analog points overwrite whatever the digital level inputs read
+static void LevelSensorUpdate(void){
+#if LEVEL_SENSOR_ANALOG
+	LevelSensorBus_Service(&levelBus);
+	uint8_t *basicIn = MachineSetting.generalSetting.Inputs.BasicIn;
+	FertPinAssignment *fert = MachineSetting.generalSetting.Fert.Fert;
+	LevelPointToInput(&tank[TANK_RESERVOIR], LEVEL_SENSOR_LOW,   basicIn[WaterResevoirLow]);
+	LevelPointToInput(&tank[TANK_RESERVOIR], LEVEL_SENSOR_HIGH,  basicIn[WaterResevoirWarning]);
+	LevelPointToInput(&tank[TANK_RESERVOIR], LEVEL_SENSOR_LIMIT, basicIn[WaterResevoirHigh]);
+	LevelPointToInput(&tank[TANK_MIX1],      LEVEL_SENSOR_LOW,   basicIn[Mix1Low]);
+	LevelPointToInput(&tank[TANK_MIX1],      LEVEL_SENSOR_HIGH,  basicIn[Mix1High]);
+	LevelPointToInput(&tank[TANK_MIX1],      LEVEL_SENSOR_LIMIT, basicIn[Mix1Limit]);
+	LevelPointToInput(&tank[TANK_MIX2],      LEVEL_SENSOR_LOW,   basicIn[Mix2Low]);
+	LevelPointToInput(&tank[TANK_MIX2],      LEVEL_SENSOR_HIGH,  basicIn[Mix2High]);
+	LevelPointToInput(&tank[TANK_MIX2],      LEVEL_SENSOR_LIMIT, basicIn[Mix2Limit]);
+	LevelPointToInput(&tank[TANK_FERT_A],    LEVEL_SENSOR_LOW,   fert[0].in[FERTIN_LOW]);
+	LevelPointToInput(&tank[TANK_FERT_A],    LEVEL_SENSOR_HIGH,  fert[0].in[FERTIN_WARNING]);
+	LevelPointToInput(&tank[TANK_FERT_A],    LEVEL_SENSOR_LIMIT, fert[0].in[FERTIN_HIGH]);
+	LevelPointToInput(&tank[TANK_FERT_B],    LEVEL_SENSOR_LOW,   fert[1].in[FERTIN_LOW]);
+	LevelPointToInput(&tank[TANK_FERT_B],    LEVEL_SENSOR_HIGH,  fert[1].in[FERTIN_WARNING]);
+	LevelPointToInput(&tank[TANK_FERT_B],    LEVEL_SENSOR_LIMIT, fert[1].in[FERTIN_HIGH]);
+#endif
+}
+
+#if LEVEL_SENSOR_ANALOG
+//"lvl":[{"tank":"Reservoir","st":"ok","raw":2172,"mv":1750,"mm":1000,"below":[0,0,1]},...],
+//below = LOW, HIGH, LIMIT points, 1 = water below that point. Not sent with digital level switches.
+static int build_level_json(char *buffer, size_t buf_size){
+	int len = snprintf(buffer, buf_size, "\"lvl\":[");
+	if(len >= (int)buf_size) return -1;
+	for(int n = 0; n < TANK_COUNT; n++){
+		const LevelSensor *sensor = &tank[n];
+		uint16_t raw = LevelSensor_GetRaw(sensor);
+		float depth = LevelSensor_GetDepth(sensor);
+		len += snprintf(buffer + len, buf_size - len,
+				"%s{\"tank\":\"%s\",\"st\":\"%s\",\"raw\":%u,\"mv\":%u,\"mm\":%ld,\"below\":[%d,%d,%d]}",
+				n == 0 ? "" : ",",
+				tankName[n],
+				LevelSensor_IsError(sensor) ? "err" : (LevelSensor_IsReady(sensor) ? "ok" : "wait"),
+				(unsigned int)raw,
+				(unsigned int)((raw * 3300u + 2047u) / 4095u),	//3.3 V reference assumed
+				(long)(depth + (depth < 0.0f ? -0.5f : 0.5f)),
+				LevelSensor_ReadPoint(sensor, LEVEL_SENSOR_LOW) == GPIO_PIN_SET,
+				LevelSensor_ReadPoint(sensor, LEVEL_SENSOR_HIGH) == GPIO_PIN_SET,
+				LevelSensor_ReadPoint(sensor, LEVEL_SENSOR_LIMIT) == GPIO_PIN_SET);
+		if(len >= (int)buf_size) return -1;
+	}
+	len += snprintf(buffer + len, buf_size - len, "],");
+	if(len >= (int)buf_size) return -1;
+	return len;
+}
+#endif
 /* USER CODE END 4 */
 
 /**
